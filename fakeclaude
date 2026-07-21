@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Launch Claude Code CLI against the local mock server.
+#
+# The env vars below are set inline for THIS invocation only — nothing is
+# written to your shell rc files or to ~/.claude. A plain `claude` still goes
+# to the real Anthropic API.
+set -euo pipefail
+
+BASE_URL="${FAKE_CLAUDE_URL:-http://127.0.0.1:8787}"
+
+# Present as a real model so the CLI's header, status line and /model output
+# look exactly like a normal session. The mock server echoes back whatever
+# model it is sent, so nothing downstream needs to know the difference.
+MODEL="${FAKE_CLAUDE_MODEL:-claude-opus-4-8}"
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "fakeclaude: 'claude' not found on PATH." >&2
+  exit 127
+fi
+
+if ! curl -fsS --max-time 2 "$BASE_URL/health" >/dev/null 2>&1; then
+  echo "fakeclaude: no mock server at $BASE_URL" >&2
+  echo "            start one with:  uv run mock_server.py" >&2
+  exit 1
+fi
+
+# Setting ANTHROPIC_AUTH_TOKEN makes the CLI print a "claude.ai connectors are
+# disabled" warning on startup — an obvious tell that something is off. Leaving
+# it unset lets the CLI use your normal login, and the mock ignores credentials
+# anyway. Set FAKE_CLAUDE_TOKEN if you aren't logged in and need one.
+if [ -n "${FAKE_CLAUDE_TOKEN:-}" ]; then
+  exec env \
+    ANTHROPIC_BASE_URL="$BASE_URL" \
+    ANTHROPIC_AUTH_TOKEN="$FAKE_CLAUDE_TOKEN" \
+    ANTHROPIC_MODEL="$MODEL" \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    claude "$@"
+fi
+
+exec env \
+  ANTHROPIC_BASE_URL="$BASE_URL" \
+  ANTHROPIC_MODEL="$MODEL" \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+  claude "$@"

@@ -1,0 +1,52 @@
+# Fallback responses for messages that don't @-reference a script.
+#
+# The main mechanism is `scripts/*.md` — ask with `@1`, `@2`, … to play a full
+# scripted transcript. These rules only cover everything else.
+#
+# Rules are checked top to bottom against the last user message. `match` is
+# tried as a case-insensitive substring first, then as a regex. The first hit
+# wins. A rule with no `match` is the default (put it last).
+#
+# Each rule may carry `response` (plain text), `thinking` (streamed during the
+# pause before it), or `tool_use` (a fake tool call). This file is re-read on
+# every request — edit it while the server runs.
+
+rules:
+  - match: \b(list|show)\b.*\bfiles\b
+    thinking: >
+      They want to see what's in the working directory. A plain listing is the
+      right call here — no need to filter or interpret before they've told me
+      what they're looking for.
+    tool_use:
+      name: Bash
+      input:
+        command: ls -la
+        description: List files in the current directory
+
+  - match: weather
+    thinking: >
+      This needs live data I don't have locally, so it's a tool call rather than
+      something I can answer from memory. Location first, units second.
+    tool_use:
+      name: get_weather
+      input:
+        location: San Francisco, CA
+        unit: fahrenheit
+
+  # Default — used when nothing above matches and no @script was referenced.
+  - thinking: >
+      No script was referenced here, so there's no transcript to play. The
+      useful thing is to say what's available rather than improvise an answer
+      that pretends to be about their actual codebase.
+    response: |
+      No script referenced — mention one with `@` to play a transcript:
+
+      | Script | Topic |
+      | --- | --- |
+      | `@1` | Reviewing an auth module |
+      | `@2` | Debugging a flaky test |
+      | `@3` | Tracking a performance regression |
+      | `@4` | Planning a refactor |
+      | `@5` | Implementing a feature end to end |
+
+      For example: `@2 review it and tell me what you'd fix first`.
