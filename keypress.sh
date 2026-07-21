@@ -59,6 +59,14 @@ TYPE_MAX_MS="${KEYS_TYPE_MAX_MS:-14}"
 # Pause between one pass over the prompt list and the next, in seconds.
 CYCLE_PAUSE="${KEYS_CYCLE_PAUSE_SECS:-2}"
 
+# Small mouse moves/scrolls around typing and Enter, purely cosmetic — a cursor
+# that never twitches while text appears is the one thing that reads as fake on
+# a recording. Needs cliclick (`brew install cliclick`); silently skipped
+# without it, since it's decoration, not something the script depends on.
+MOUSE_ACTIVITY="${KEYS_MOUSE_ACTIVITY:-1}"
+CLICLICK="$(command -v cliclick || true)"
+[ -n "$CLICLICK" ] || MOUSE_ACTIVITY=0
+
 PROMPT_FILE=""
 CYCLES="${KEYS_CYCLES:-1}"
 declare -a PROMPTS=()
@@ -157,7 +165,27 @@ osa() {
 }
 
 press_enter() {
+  jiggle_mouse
   osa -e 'tell application "System Events" to key code 36'
+}
+
+# Small relative move, a few px in any direction — enough to register as
+# activity on screen without the cursor visibly jumping around.
+jiggle_mouse() {
+  [ "$MOUSE_ACTIVITY" = "1" ] || return 0
+  local dx dy
+  dx=$(( (RANDOM % 17) - 8 ))
+  dy=$(( (RANDOM % 17) - 8 ))
+  "$CLICLICK" "m:+${dx},+${dy}" >/dev/null 2>&1 || true
+}
+
+# A couple of wheel notches, as if glancing back up the transcript while
+# waiting on a reply.
+scroll_mouse() {
+  [ "$MOUSE_ACTIVITY" = "1" ] || return 0
+  local amt
+  amt=$(( (RANDOM % 3) + 1 ))
+  "$CLICLICK" "w:0,-${amt}" >/dev/null 2>&1 || true
 }
 
 # The per-character loop lives in AppleScript, not here. One osascript process
@@ -188,6 +216,11 @@ type_text() {
 osa -e 'tell application "System Events" to key code 63'
 
 note "keystrokes allowed — $TERM_APP has Accessibility"
+if [ "$MOUSE_ACTIVITY" = "1" ]; then
+  note "mouse activity on — cliclick found at $CLICLICK"
+else
+  note "mouse activity off — install with 'brew install cliclick' to enable"
+fi
 note "focus the Claude Code terminal now — starting in 5s"
 sleep 5
 
@@ -207,6 +240,7 @@ idx=0
 send_prompt() {
   local prompt="${PROMPTS[$idx]}"
   note "prompt $((idx + 1))/${#PROMPTS[@]}: $prompt"
+  jiggle_mouse
   type_text "$prompt"
   sleep 0.4
   press_enter
@@ -241,6 +275,7 @@ while IFS= read -r line <&3; do
         note "cycle $cycle — pausing ${CYCLE_PAUSE}s"
         sleep "$CYCLE_PAUSE"
       else
+        scroll_mouse
         sleep "$READ_SECS"
       fi
       send_prompt

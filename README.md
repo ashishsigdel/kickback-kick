@@ -2,7 +2,7 @@
 
 1. Open Terminal on your Mac:
 
-ssh -i ~/Desktop/kickback-kick.pem ubuntu@3.14.85.187
+ssh -i ~/Desktop/kickback-kick.pem ubuntu@3.22.126.134
 
 2. Attach to the driver:
 
@@ -12,7 +12,7 @@ tmux attach -t driver
 
 1. Terminal on your Mac — open the tunnel and leave it running:
 
-ssh -i ~/Desktop/kickback-kick.pem -L 5901:localhost:5901 ubuntu@3.14.85.187
+ssh -i ~/Desktop/kickback-kick.pem -L 5901:localhost:5901 ubuntu@3.22.126.134
 
 Note the -L 5901:localhost:5901 — that's the only difference from your other command.
 

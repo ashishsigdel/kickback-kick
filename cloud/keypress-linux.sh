@@ -63,6 +63,11 @@ TYPE_MAX_MS="${KEYS_TYPE_MAX_MS:-14}"
 # Pause between one pass over the prompt list and the next, in seconds.
 CYCLE_PAUSE="${KEYS_CYCLE_PAUSE_SECS:-2}"
 
+# Small mouse moves/scrolls around typing and Enter, purely cosmetic — a cursor
+# that never twitches while text appears is the one thing that reads as fake on
+# a recording. xdotool already handles the keystrokes, so no new dependency.
+MOUSE_ACTIVITY="${KEYS_MOUSE_ACTIVITY:-1}"
+
 PROMPT_FILE=""
 CYCLES="${KEYS_CYCLES:-1}"
 declare -a PROMPTS=()
@@ -179,7 +184,29 @@ focus_target() {
 }
 
 press_enter() {
+  jiggle_mouse
   xdotool key --clearmodifiers Return
+}
+
+# Small relative move, a few px in any direction — enough to register as
+# activity on screen without the cursor visibly jumping around. Moving the
+# mouse doesn't steal focus under openbox's click-to-focus, so this is safe
+# to fire mid-run.
+jiggle_mouse() {
+  [ "$MOUSE_ACTIVITY" = "1" ] || return 0
+  local dx dy
+  dx=$(( (RANDOM % 17) - 8 ))
+  dy=$(( (RANDOM % 17) - 8 ))
+  xdotool mousemove_relative -- "$dx" "$dy" 2>/dev/null || true
+}
+
+# A couple of wheel notches, as if glancing back up the transcript while
+# waiting on a reply. Button 4/5 are the scroll-up/scroll-down XTEST buttons.
+scroll_mouse() {
+  [ "$MOUSE_ACTIVITY" = "1" ] || return 0
+  local n
+  n=$(( (RANDOM % 3) + 1 ))
+  xdotool click --repeat "$n" 5 2>/dev/null || true
 }
 
 # One xdotool process per character, unlike the macOS version which pushes the
@@ -205,6 +232,7 @@ type_text() {
 
 focus_target
 note "typing into window $WINDOW_ID ('$WINDOW_NAME') on $DISPLAY"
+[ "$MOUSE_ACTIVITY" = "1" ] && note "mouse activity on" || note "mouse activity off (KEYS_MOUSE_ACTIVITY=0)"
 note "starting in 5s"
 sleep 5
 
@@ -238,6 +266,7 @@ send_prompt() {
   # hint or a reconnecting VNC client can move it, and a prompt typed into the
   # void is indistinguishable from a hung server until much later.
   xdotool windowactivate --sync "$WINDOW_ID" 2>/dev/null || true
+  jiggle_mouse
   type_text "$prompt"
   sleep 0.4
   press_enter
@@ -272,6 +301,7 @@ while IFS= read -r line <&3; do
         note "cycle $cycle — pausing ${CYCLE_PAUSE}s"
         sleep "$CYCLE_PAUSE"
       else
+        scroll_mouse
         sleep "$READ_SECS"
       fi
       send_prompt
