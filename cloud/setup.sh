@@ -324,8 +324,10 @@ cat <<EOF
 
 Next, from your laptop:
 
-  1. copy credentials so the CLI doesn't show the connectors banner
-       scp -r ~/.claude $USER@<host>:~/
+  1. log in, so the CLI doesn't show the connectors banner. Do it HERE, not by
+     copying ~/.claude from a Mac — macOS keeps the token in the Keychain, so
+     that directory holds transcripts and no credentials.
+       source ~/.bashrc && claude
 
   2. tunnel, then point any VNC viewer at localhost:$VNC_PORT
        ssh -L $VNC_PORT:localhost:$VNC_PORT $USER@<host>

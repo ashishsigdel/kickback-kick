@@ -1,5 +1,27 @@
 # fake-claude
 
+1. Open Terminal on your Mac:
+
+ssh -i ~/Desktop/kickback-kick.pem ubuntu@3.14.85.187
+
+2. Attach to the driver:
+
+tmux attach -t driver
+
+---
+
+1. Terminal on your Mac — open the tunnel and leave it running:
+
+ssh -i ~/Desktop/kickback-kick.pem -L 5901:localhost:5901 ubuntu@3.14.85.187
+
+Note the -L 5901:localhost:5901 — that's the only difference from your other command.
+
+2. Finder → Go → Connect to Server (Cmd-K), enter:
+
+vnc://localhost:5901
+
+Enter your VNC password. VS Code appears, still typing.
+
 A local mock of the Anthropic Messages API, so you can drive the Claude Code CLI
 against canned responses without spending credits.
 
@@ -91,11 +113,11 @@ It listens on `http://127.0.0.1:8787` and prints its resolved config at startup:
 
 ### Endpoints
 
-| Endpoint | Behavior |
-| --- | --- |
-| `POST /v1/messages` | Streaming (`"stream": true`) SSE, or a standard JSON message object |
-| `POST /v1/messages/count_tokens` | `{"input_tokens": 1}` |
-| `GET /health` | `{"ok": true}` |
+| Endpoint                         | Behavior                                                            |
+| -------------------------------- | ------------------------------------------------------------------- |
+| `POST /v1/messages`              | Streaming (`"stream": true`) SSE, or a standard JSON message object |
+| `POST /v1/messages/count_tokens` | `{"input_tokens": 1}`                                               |
+| `GET /health`                    | `{"ok": true}`                                                      |
 
 Whatever `model` the request sends is echoed back in the response.
 
@@ -155,13 +177,13 @@ each an alternating sequence of thinking and replies — and you play one by
 > @2 review it and tell me what you'd fix first
 ```
 
-| Script | Topic |
-| --- | --- |
-| `@1` | Reviewing an auth module — timing-unsafe compare, token expiry, revocation |
-| `@2` | Debugging a flaky test — isolating shared fixture state |
-| `@3` | Tracking a performance regression — an N+1 introduced by a readable refactor |
-| `@4` | Planning a refactor — finding seams, avoiding import cycles |
-| `@5` | Implementing a feature — rate limiting, atomicity, verifying the test matters |
+| Script | Topic                                                                         |
+| ------ | ----------------------------------------------------------------------------- |
+| `@1`   | Reviewing an auth module — timing-unsafe compare, token expiry, revocation    |
+| `@2`   | Debugging a flaky test — isolating shared fixture state                       |
+| `@3`   | Tracking a performance regression — an N+1 introduced by a readable refactor  |
+| `@4`   | Planning a refactor — finding seams, avoiding import cycles                   |
+| `@5`   | Implementing a feature — rate limiting, atomicity, verifying the test matters |
 
 `@1`, `@1.md`, and `@scripts/1.md` all resolve to `scripts/1.md`. Anything that
 doesn't resolve falls through to `responses.yaml`.
@@ -252,7 +274,7 @@ The pause length is re-rolled every time from `THINK_MIN_MS`..`THINK_MAX_MS`
 **Every gap is a real `thinking` block, not dead air.** The CLI sends
 `thinking: {"type": "adaptive"}`, so the server streams actual `thinking_delta`
 chunks paced to fill the whole pause. You see the thinking text scroll for the
-full 10–15s before each response — including the gaps *between* responses, not
+full 10–15s before each response — including the gaps _between_ responses, not
 just the first one:
 
 ```
@@ -273,9 +295,9 @@ The thinking prose is generic filler by default. To script it, add a `thinking`
 key to any rule in `responses.yaml`:
 
 ```yaml
-  - match: hello
-    thinking: Checking whether this one needs the real API. It does not.
-    response: Hey! Nothing here touched the real API.
+- match: hello
+  thinking: Checking whether this one needs the real API. It does not.
+  response: Hey! Nothing here touched the real API.
 ```
 
 A pause never overruns the budget — it is clamped to whatever time is left, and
@@ -335,16 +357,16 @@ without tracebacks:
 
 ### Other settings
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `FAKE_DURATION` | `unlimited` | Run budget: `30s`, `5m`, `1h`, `90`, `unlimited` |
-| `CHUNK_DELAY_MS` | `40` | Delay between streamed text deltas |
-| `TURN_DELAY_MS` | `500` | Pause between simulated agentic turns |
-| `THINK_MIN_MS` | `5000` | Shortest random "thinking" pause before a response |
-| `THINK_MAX_MS` | `7000` | Longest random "thinking" pause before a response |
-| `SCRIPT_LOOP` | `true` | Restart a script from the top when it runs out |
-| `HOST` | `127.0.0.1` | Bind address |
-| `PORT` | `8787` | Bind port |
+| Variable         | Default     | Meaning                                            |
+| ---------------- | ----------- | -------------------------------------------------- |
+| `FAKE_DURATION`  | `unlimited` | Run budget: `30s`, `5m`, `1h`, `90`, `unlimited`   |
+| `CHUNK_DELAY_MS` | `40`        | Delay between streamed text deltas                 |
+| `TURN_DELAY_MS`  | `500`       | Pause between simulated agentic turns              |
+| `THINK_MIN_MS`   | `5000`      | Shortest random "thinking" pause before a response |
+| `THINK_MAX_MS`   | `7000`      | Longest random "thinking" pause before a response  |
+| `SCRIPT_LOOP`    | `true`      | Restart a script from the top when it runs out     |
+| `HOST`           | `127.0.0.1` | Bind address                                       |
+| `PORT`           | `8787`      | Bind port                                          |
 
 ## Hands-off driving (`drive.sh`)
 
@@ -370,22 +392,22 @@ A turn is considered finished once the CLI has been silent for `DRIVE_IDLE_SECS`
 (default `4`) — comfortably longer than the server's ~0.8s worst-case gap between
 chunks. Ctrl-C stops the driver and the CLI with it.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `DRIVE_IDLE_SECS` | `4` | Silence that marks the end of a turn |
-| `DRIVE_READ_SECS` | `3` | Pause after a reply before typing the next prompt |
-| `DRIVE_TYPE_MIN_MS` | `35` | Fastest per-character typing delay |
-| `DRIVE_TYPE_MAX_MS` | `110` | Slowest per-character typing delay |
-| `DRIVE_CYCLES` | `1` | Passes over the prompt list (`forever` to keep going) |
-| `DRIVE_CYCLE_PAUSE_SECS` | `30` | Pause between one pass and the next |
-| `DRIVE_CAFFEINATE` | `1` | Set to `0` to let the machine sleep normally |
+| Variable                 | Default | Meaning                                               |
+| ------------------------ | ------- | ----------------------------------------------------- |
+| `DRIVE_IDLE_SECS`        | `4`     | Silence that marks the end of a turn                  |
+| `DRIVE_READ_SECS`        | `3`     | Pause after a reply before typing the next prompt     |
+| `DRIVE_TYPE_MIN_MS`      | `35`    | Fastest per-character typing delay                    |
+| `DRIVE_TYPE_MAX_MS`      | `110`   | Slowest per-character typing delay                    |
+| `DRIVE_CYCLES`           | `1`     | Passes over the prompt list (`forever` to keep going) |
+| `DRIVE_CYCLE_PAUSE_SECS` | `30`    | Pause between one pass and the next                   |
+| `DRIVE_CAFFEINATE`       | `1`     | Set to `0` to let the machine sleep normally          |
 
 ### Staying awake
 
 The driver re-executes itself under `caffeinate -dimsu`, which holds four power
 assertions — display sleep, idle sleep, disk sleep, system sleep — plus a
 "user is active" declaration, for as long as the run lasts. Because `caffeinate`
-is launched with the driver *as its utility*, macOS releases every assertion the
+is launched with the driver _as its utility_, macOS releases every assertion the
 instant the driver exits. No power settings are changed and nothing survives the
 run; `pmset -g assertions` shows them appear and disappear with it.
 

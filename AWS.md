@@ -21,14 +21,14 @@ you close your laptop**.
 
 In the EC2 console:
 
-| Setting | Value |
-|---|---|
-| AMI | **Ubuntu Server 24.04 LTS** |
-| Instance type | **t3.small** (2 GB RAM) |
-| Key pair | create or pick one — you need it for SSH |
-| Storage | 12 GB gp3 |
-| Security group | **SSH (22) only** |
-| Region | `us-east-2` (Ohio) — same as your Render service |
+| Setting        | Value                                            |
+| -------------- | ------------------------------------------------ |
+| AMI            | **Ubuntu Server 24.04 LTS**                      |
+| Instance type  | **t3.small** (2 GB RAM)                          |
+| Key pair       | create or pick one — you need it for SSH         |
+| Storage        | 12 GB gp3                                        |
+| Security group | **SSH (22) only**                                |
+| Region         | `us-east-2` (Ohio) — same as your Render service |
 
 **Do not open port 5901.** VNC stays on localhost and you reach it through an
 SSH tunnel.
@@ -41,18 +41,18 @@ but that's sized for real development — indexing large repos, running builds.
 Here it replays canned responses and never reads a real codebase. What actually
 runs:
 
-| | |
-|---|---|
-| Xvnc + openbox | ~100 MB |
+|                    |             |
+| ------------------ | ----------- |
+| Xvnc + openbox     | ~100 MB     |
 | VS Code (Electron) | ~500-700 MB |
-| Claude Code | ~200-300 MB |
-| **total** | **~1 GB** |
+| Claude Code        | ~200-300 MB |
+| **total**          | **~1 GB**   |
 
-| instance | RAM | works? | ~$/mo if left on |
-|---|---|---|---|
-| `t3.micro` | 1 GB | only with `FAKE_VSCODE=0` | ~$7.50 (free tier eligible) |
-| **`t3.small`** | 2 GB | **yes — the sensible default** | ~$15 |
-| `t3.medium` | 4 GB | comfortable, unnecessary here | ~$30 |
+| instance       | RAM  | works?                         | ~$/mo if left on            |
+| -------------- | ---- | ------------------------------ | --------------------------- |
+| `t3.micro`     | 1 GB | only with `FAKE_VSCODE=0`      | ~$7.50 (free tier eligible) |
+| **`t3.small`** | 2 GB | **yes — the sensible default** | ~$15                        |
+| `t3.medium`    | 4 GB | comfortable, unnecessary here  | ~$30                        |
 
 setup.sh adds a **2 GB swap file** (skip with `FAKE_SWAP=0`), which is what makes
 2 GB safe: steady state is fine, but VS Code's startup spike has little headroom,
@@ -69,7 +69,7 @@ monthly figures above only apply if you leave it running.
 SSH in:
 
 ```bash
-ssh -i your-key.pem ubuntu@<your-ec2-ip>
+ssh -i ~/Desktop/kickback-kick.pem ubuntu@3.14.85.187
 ```
 
 Then:
@@ -91,17 +91,32 @@ To skip VS Code and use a plain terminal instead, prefix with `FAKE_VSCODE=0`.
 
 ---
 
-## Step 3 — Copy your Claude credentials
+## Step 3 — Log in on the box
 
-**From your laptop**, in a second terminal:
+**Do not copy `~/.claude` from a Mac.** It doesn't contain the credentials —
+macOS keeps the OAuth token in the Keychain, not in that directory. All you'd
+move is ~95 MB of transcripts from every project you've ever run, onto a machine
+that has no business holding them.
+
+Log in on the instance instead, which writes its own
+`~/.claude/.credentials.json`:
 
 ```bash
-scp -i your-key.pem -r ~/.claude ubuntu@<your-ec2-ip>:~/
+claude
 ```
 
-Without this the CLI has no login. The workaround (`FAKE_CLAUDE_TOKEN`) makes it
-print a *"claude.ai connectors are disabled"* banner, which is an obvious tell
-in a recording — so copy the credentials instead.
+Follow the prompt. If the login needs a browser and can't find one, install a
+lightweight one and run `claude` from the VNC session so it can open there:
+
+```bash
+sudo apt-get install -y firefox
+```
+
+This is a one-time step — the credentials persist on the instance.
+
+Why bother at all, when the mock server ignores credentials entirely? Because
+the alternative, `FAKE_CLAUDE_TOKEN`, makes the CLI print a _"claude.ai
+connectors are disabled"_ banner at startup, which is an obvious tell on camera.
 
 ---
 
@@ -110,7 +125,7 @@ in a recording — so copy the credentials instead.
 **From your laptop**, open the tunnel and leave it running:
 
 ```bash
-ssh -i your-key.pem -L 5901:localhost:5901 ubuntu@<your-ec2-ip>
+ssh -i ~/Desktop/kickback-kick.pem -L 5901:localhost:5901 ubuntu@3.14.85.187
 ```
 
 Then open a VNC viewer at **`localhost:5901`**:
@@ -163,10 +178,10 @@ Come back with `tmux attach -t driver`.
 It doesn't read the CLI's output — it can't. It subscribes to the server's
 `/events` stream and reacts:
 
-| server says | driver does |
-|---|---|
-| `tool_use` | waits 0.5s, presses Enter to approve the permission prompt |
-| `turn_end` | waits 3s, types the next prompt |
+| server says | driver does                                                |
+| ----------- | ---------------------------------------------------------- |
+| `tool_use`  | waits 0.5s, presses Enter to approve the permission prompt |
+| `turn_end`  | waits 3s, types the next prompt                            |
 
 Options:
 
@@ -237,12 +252,12 @@ tmux attach -t driver        # watch it
 tmux kill-session -t driver  # stop it
 ```
 
-| unit | what it is |
-|---|---|
-| `fake-claude-vnc` | the X display on `:1` |
-| `fake-claude-desktop` | window manager, screensaver off |
-| `fake-claude-vscode` | VS Code + auto-started Claude Code |
-| `fake-claude-term` | plain xterm alternative (`FAKE_VSCODE=0`) |
+| unit                  | what it is                                |
+| --------------------- | ----------------------------------------- |
+| `fake-claude-vnc`     | the X display on `:1`                     |
+| `fake-claude-desktop` | window manager, screensaver off           |
+| `fake-claude-vscode`  | VS Code + auto-started Claude Code        |
+| `fake-claude-term`    | plain xterm alternative (`FAKE_VSCODE=0`) |
 
 The first two are enabled, so they return after a reboot.
 
@@ -254,7 +269,7 @@ The first two are enabled, so they return after a reboot.
 the VS Code terminal once, or check `KEYS_WINDOW` matches the window title.
 
 **VS Code opens but no terminal starts.** The automatic task was blocked. In VS
-Code: `Ctrl-Shift-P` → *Tasks: Allow Automatic Tasks* → then restart the unit.
+Code: `Ctrl-Shift-P` → _Tasks: Allow Automatic Tasks_ → then restart the unit.
 
 **First prompt of the day hangs ~50 seconds.** Render's free tier sleeps after
 15 minutes idle. The scripts wait it out and print `waking …`. Expected.
@@ -273,12 +288,12 @@ Usually memory. Check `free -h` shows swap active; if you're on t3.micro, run wi
 
 ## Cost
 
-| | |
-|---|---|
-| Render free tier | **$0** |
-| t3.small running | ~$0.021/hr, ~$15/mo if left on |
-| t3.small **stopped** | ~$1/mo (just the 12 GB disk) |
-| t3.small, 4 hrs of filming | **~$0.08** |
+|                            |                                |
+| -------------------------- | ------------------------------ |
+| Render free tier           | **$0**                         |
+| t3.small running           | ~$0.021/hr, ~$15/mo if left on |
+| t3.small **stopped**       | ~$1/mo (just the 12 GB disk)   |
+| t3.small, 4 hrs of filming | **~$0.08**                     |
 
 **Stop the instance in the EC2 console when you're not filming.** That's the
 difference between $15/month and a few cents. Everything comes back on start,
