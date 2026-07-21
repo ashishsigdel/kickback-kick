@@ -1,0 +1,41 @@
+# Render blueprint for the mock server. Deploy with:
+#   Render dashboard > New > Blueprint > point at this repo
+#
+# Only the server lives here. The Claude Code CLI and the driver run on EC2 and
+# talk to this over https — see AWS.md.
+services:
+  - type: web
+    name: fake-claude-server
+    runtime: python
+    plan: free
+    # uv is the project's only dependency manager; installing it here keeps
+    # pyproject.toml/uv.lock the single source of truth instead of maintaining a
+    # parallel requirements.txt that drifts.
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: uv run --no-sync mock_server.py
+    healthCheckPath: /health
+    envVars:
+      # Render routes to whatever port it hands you in $PORT, and reaches the
+      # container on all interfaces — the 127.0.0.1 default would be unreachable.
+      # PORT itself is injected by Render; mock_server.py already reads both.
+      - key: HOST
+        value: 0.0.0.0
+      - key: PYTHON_VERSION
+        value: 3.12.0
+
+      # .env is gitignored, so nothing here inherits your local settings — every
+      # value the run depends on has to be spelled out.
+      - key: FAKE_DURATION
+        value: unlimited
+      - key: CHUNK_DELAY_MS
+        value: "40"
+      - key: TURN_DELAY_MS
+        value: "500"
+      - key: THINK_MIN_MS
+        value: "5000"
+      - key: THINK_MAX_MS
+        value: "7000"
+      # Looping never ends a transcript, and an unattended driver waits on
+      # turn_end forever if one never arrives.
+      - key: SCRIPT_LOOP
+        value: "false"

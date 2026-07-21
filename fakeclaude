@@ -18,10 +18,27 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 127
 fi
 
-if ! curl -fsS --max-time 2 "$BASE_URL/health" >/dev/null 2>&1; then
-  echo "fakeclaude: no mock server at $BASE_URL" >&2
-  echo "            start one with:  uv run mock_server.py" >&2
-  exit 1
+# A 2s check is right for a server on localhost and wrong for a hosted one: a
+# free-tier Render service sleeps after ~15 minutes idle and needs the better
+# part of a minute to wake, so the first launch of the day would always be told
+# there was no server at all. Wait the cold start out before giving up.
+WAKE_SECS="${FAKE_CLAUDE_WAKE_SECS:-90}"
+
+if ! curl -fsS --max-time 5 "$BASE_URL/health" >/dev/null 2>&1; then
+  printf 'fakeclaude: waking %s (up to %ss)' "$BASE_URL" "$WAKE_SECS" >&2
+  deadline=$(( SECONDS + WAKE_SECS ))
+  until curl -fsS --max-time 10 "$BASE_URL/health" >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      printf '\n' >&2
+      echo "fakeclaude: no mock server at $BASE_URL" >&2
+      echo "            local:  uv run mock_server.py" >&2
+      echo "            hosted: check the service is live in the Render dashboard" >&2
+      exit 1
+    fi
+    printf '.' >&2
+    sleep 2
+  done
+  printf ' up\n' >&2
 fi
 
 # Setting ANTHROPIC_AUTH_TOKEN makes the CLI print a "claude.ai connectors are

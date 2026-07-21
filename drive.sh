@@ -86,9 +86,26 @@ command -v expect >/dev/null 2>&1 || { echo "drive.sh: 'expect' not found on PAT
 [ -x "$LAUNCHER" ] || { echo "drive.sh: $LAUNCHER not found or not executable." >&2; exit 1; }
 
 BASE_URL="${FAKE_CLAUDE_URL:-http://127.0.0.1:8787}"
-if ! curl -fsS --max-time 2 "$BASE_URL/health" >/dev/null 2>&1; then
+
+# Same cold-start allowance as fakeclaude — a sleeping free-tier host answers
+# nothing for the first ~50s, and this preflight runs before the launcher gets
+# its own chance to wait.
+WAKE_SECS="${FAKE_CLAUDE_WAKE_SECS:-90}"
+if ! curl -fsS --max-time 5 "$BASE_URL/health" >/dev/null 2>&1; then
+  printf 'drive.sh: waking %s (up to %ss)' "$BASE_URL" "$WAKE_SECS" >&2
+  deadline=$(( SECONDS + WAKE_SECS ))
+  until curl -fsS --max-time 10 "$BASE_URL/health" >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then printf '\n' >&2; break; fi
+    printf '.' >&2
+    sleep 2
+  done
+  printf ' up\n' >&2
+fi
+
+if ! curl -fsS --max-time 10 "$BASE_URL/health" >/dev/null 2>&1; then
   echo "drive.sh: no mock server at $BASE_URL" >&2
-  echo "          start one with:  uv run mock_server.py" >&2
+  echo "          local:  uv run mock_server.py" >&2
+  echo "          hosted: check the service is live in the Render dashboard" >&2
   exit 1
 fi
 
@@ -110,7 +127,10 @@ echo "drive.sh: cycles=$CYCLES, pause between cycles=${CYCLE_PAUSE}s"
 echo "drive.sh: driving $LAUNCHER — hands off the keyboard, Ctrl-C to stop"
 echo
 
-EXP_FILE="$(mktemp -t drive)"
+# A full template rather than -t: BSD mktemp treats a bare -t name as a prefix
+# and appends its own suffix, GNU mktemp rejects it for having fewer than three
+# X's. Spelling out the path sidesteps the difference and runs on both.
+EXP_FILE="$(mktemp "${TMPDIR:-/tmp}/drive.XXXXXX")"
 trap 'rm -f "$EXP_FILE"' EXIT
 trap 'echo; echo "drive.sh: interrupted — stopping"; exit 130' INT TERM
 

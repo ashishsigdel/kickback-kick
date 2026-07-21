@@ -397,6 +397,18 @@ Requires `expect`, which ships with macOS. Set `SCRIPT_LOOP=false` before an
 unattended run — with looping on, a transcript never ends and the driver waits
 on it forever.
 
+## Running it in the cloud
+
+[`AWS.md`](AWS.md) covers the split deployment: the mock server free on Render,
+the CLI and driver on a small EC2 box with a persistent VNC desktop that keeps
+running after you disconnect. `render.yaml` is the Render blueprint,
+`cloud/setup.sh` provisions the Ubuntu instance, and `cloud/keypress-linux.sh`
+is the `xdotool` port of `keypress.sh` for X.
+
+`FAKE_CLAUDE_URL` is what makes the split work — every script takes a full base
+URL and defaults to `http://127.0.0.1:8787`, so the same commands run locally or
+against a hosted server.
+
 ## Logging
 
 Every request prints one readable line to stdout — method, path, model, last
