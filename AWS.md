@@ -1,219 +1,273 @@
-# Deploying fake-claude
+# Running fake-claude on AWS
 
-Split across two places: the mock server on **Render's free tier**, and the
-desktop + CLI + driver on a **small EC2 instance**. Recording happens on your
-own machine, over VNC, whenever you feel like watching.
+The server is already live on Render. This sets up an EC2 box that runs VS Code
+with Claude Code inside it, types prompts by itself, and **keeps running after
+you close your laptop**.
 
 ```
-   your laptop                EC2 t3.small                 Render (free)
-  ┌────────────┐             ┌──────────────────┐         ┌──────────────┐
-  │ VNC viewer │◄──tunnel───►│ Xvnc :1          │         │ mock_server  │
-  │ + your own │             │  └ openbox       │         │ :443 https   │
-  │   recorder │             │     └ xterm      │──────►  │              │
-  └────────────┘             │        └ claude  │  https  │  /v1/messages│
-    attach, record,          │ keypress-linux   │──────►  │  /events     │
-    close — run continues    └──────────────────┘         └──────────────┘
-                                  ~$15/mo                       $0
+   your laptop              EC2 t3.small                Render (free)
+  ┌────────────┐           ┌────────────────────┐       ┌──────────────┐
+  │ VNC viewer │◄─tunnel──►│ VS Code            │       │ kickback-kick│
+  │ + your own │           │  └ terminal        │──────►│ .onrender.com│
+  │   recorder │           │     └ claude       │ https │              │
+  └────────────┘           │ keypress-linux.sh  │       └──────────────┘
+   close it anytime;       └────────────────────┘             $0
+   the run continues            ~$15/mo
 ```
-
-**Why this split works:** `fakeclaude` and `drive.sh` already read a full base
-URL from `FAKE_CLAUDE_URL` (drive.sh:88), so pointing them at an `https://` host
-needs no code change. And `/events` self-pings every 15 seconds
-(mock_server.py:805-809), which keeps the SSE stream alive through Render's
-proxy idle timeout.
 
 ---
 
-## Part 1 — Server on Render
+## Step 1 — Launch the instance
 
-`render.yaml` in the repo root is a blueprint; Render reads it and configures
-everything.
+In the EC2 console:
 
-1. Push this repo to GitHub. **Make sure `scripts/` is committed** — those are
-   the `@1`…`@10` transcripts, and without them the server has nothing to play.
-2. Render dashboard → **New → Blueprint** → pick the repo.
-3. Deploy. You get `https://fake-claude-server-xxxx.onrender.com`.
+| Setting | Value |
+|---|---|
+| AMI | **Ubuntu Server 24.04 LTS** |
+| Instance type | **t3.small** (2 GB RAM) |
+| Key pair | create or pick one — you need it for SSH |
+| Storage | 12 GB gp3 |
+| Security group | **SSH (22) only** |
+| Region | `us-east-2` (Ohio) — same as your Render service |
 
-Check it:
+**Do not open port 5901.** VNC stays on localhost and you reach it through an
+SSH tunnel.
 
-```bash
-curl https://<your-service>.onrender.com/health     # {"ok":true}
-```
+### Picking a size
 
-The blueprint sets `HOST=0.0.0.0` (the `127.0.0.1` default would be unreachable
-inside a container) and lets Render inject `$PORT`. `mock_server.py` already
-reads both from the environment (mock_server.py:98-99), so no code changed.
-
-`.env` is gitignored and therefore absent on Render — every setting the run
-depends on is spelled out in `render.yaml` instead. Note `SCRIPT_LOOP=false`:
-with looping on, a transcript never ends, and an unattended driver waits on a
-`turn_end` that never comes.
-
-### Free-tier behaviour you need to know
-
-**It sleeps after ~15 minutes idle and takes ~50s to wake.** All three scripts
-now wait that out instead of reporting a dead server — they print
-`waking https://… (up to 90s)` and dot along until it answers. Tune with
-`FAKE_CLAUDE_WAKE_SECS`. Once a run is going the constant traffic keeps it up.
-
-**Restarts drop the SSE stream.** `keypress-linux.sh` reconnects automatically
-rather than exiting. It's not seamless — events emitted while disconnected are
-lost, and a missed `turn_end` leaves the driver waiting forever. If a run stalls
-with the CLI plainly idle, that's this: Ctrl-C and restart.
-
-**750 instance-hours/month**, plenty for one sleepy service.
-
-**The URL is public.** It only ever serves canned text, so there's not much to
-steal, but anyone who finds it can burn your instance hours. Don't post it.
-
----
-
-## Part 2 — EC2
+Claude Code
+[documents a 4 GB minimum](https://code.claude.com/docs/en/setup#system-requirements),
+but that's sized for real development — indexing large repos, running builds.
+Here it replays canned responses and never reads a real codebase. What actually
+runs:
 
 | | |
 |---|---|
-| type | `t3.small` (2 GB) — X + xterm + the CLI won't fit comfortably in t3.micro's 1 GB |
-| AMI | Ubuntu Server 24.04 LTS |
-| disk | 8 GB is fine — nothing gets recorded here |
-| cost | ~$0.0208/hr, ~$15/mo running continuously |
-| ports | **inbound SSH (22) only** |
+| Xvnc + openbox | ~100 MB |
+| VS Code (Electron) | ~500-700 MB |
+| Claude Code | ~200-300 MB |
+| **total** | **~1 GB** |
 
-Do not open 5901. VNC stays bound to localhost and you reach it through an SSH
-tunnel, so a weak VNC password can't cost you the box.
+| instance | RAM | works? | ~$/mo if left on |
+|---|---|---|---|
+| `t3.micro` | 1 GB | only with `FAKE_VSCODE=0` | ~$7.50 (free tier eligible) |
+| **`t3.small`** | 2 GB | **yes — the sensible default** | ~$15 |
+| `t3.medium` | 4 GB | comfortable, unnecessary here | ~$30 |
+
+setup.sh adds a **2 GB swap file** (skip with `FAKE_SWAP=0`), which is what makes
+2 GB safe: steady state is fine, but VS Code's startup spike has little headroom,
+and the OOM killer picks the largest process — the one you're filming.
+
+**If you stop the instance between sessions, the type barely matters.** EC2
+bills by the second; four hours of filming on t3.small is about 8 cents. The
+monthly figures above only apply if you leave it running.
+
+---
+
+## Step 2 — Install everything
+
+SSH in:
+
+```bash
+ssh -i your-key.pem ubuntu@<your-ec2-ip>
+```
+
+Then:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-git clone <your-repo-url> fake-claude
+git clone https://github.com/ashishsigdel/kickback-kick.git fake-claude
 cd fake-claude
-FAKE_CLAUDE_URL=https://<your-service>.onrender.com ./cloud/setup.sh
+FAKE_CLAUDE_URL=https://kickback-kick.onrender.com ./cloud/setup.sh
 ```
 
-Passing `FAKE_CLAUDE_URL` tells setup.sh the server is somebody else's problem:
-it skips the local server unit entirely (and removes a stale one, which would
-otherwise answer on 127.0.0.1 and quietly win), and bakes the URL into the
-terminal service.
+It asks you to set a VNC password, then installs and configures everything:
+the VNC desktop, Claude Code, VS Code, and the services. Takes a few minutes.
 
-**Lingering is what makes it survive disconnect.** By default systemd kills your
-entire user service manager when your last SSH session ends. `setup.sh` runs
-`loginctl enable-linger` to stop that.
+Passing `FAKE_CLAUDE_URL` tells it the server is on Render, so it doesn't run
+one locally.
 
-### Credentials
-
-The one step with a trap. `fakeclaude` deliberately leaves
-`ANTHROPIC_AUTH_TOKEN` unset, because setting it makes the CLI print a
-*"claude.ai connectors are disabled"* banner — an obvious tell on camera. Copy
-your login over instead:
-
-```bash
-scp -r ~/.claude ubuntu@<host>:~/
-```
+To skip VS Code and use a plain terminal instead, prefix with `FAKE_VSCODE=0`.
 
 ---
 
-## Part 3 — Run and record
+## Step 3 — Copy your Claude credentials
 
-Open the tunnel from your laptop:
+**From your laptop**, in a second terminal:
 
 ```bash
-ssh -L 5901:localhost:5901 ubuntu@<host>
+scp -i your-key.pem -r ~/.claude ubuntu@<your-ec2-ip>:~/
 ```
 
-Point a VNC viewer at **`localhost:5901`**:
+Without this the CLI has no login. The workaround (`FAKE_CLAUDE_TOKEN`) makes it
+print a *"claude.ai connectors are disabled"* banner, which is an obvious tell
+in a recording — so copy the credentials instead.
 
-- **macOS** — Finder → Go → Connect to Server → `vnc://localhost:5901`
-- **anywhere** — [TigerVNC](https://tigervnc.org/) or RealVNC Viewer
+---
 
-On the box:
+## Step 4 — Connect and look at it
+
+**From your laptop**, open the tunnel and leave it running:
 
 ```bash
-systemctl --user start fake-claude-term
-cd ~/fake-claude && ./cloud/keypress-linux.sh --forever
+ssh -i your-key.pem -L 5901:localhost:5901 ubuntu@<your-ec2-ip>
 ```
 
-Then record locally — QuickTime, OBS, `Cmd-Shift-5`, whatever you use — while
-the viewer is open. Close it when you have what you need. **The run doesn't
-notice.** Come back in an hour and it's still going, mid-transcript.
+Then open a VNC viewer at **`localhost:5901`**:
 
-Run the driver under `tmux` so you can detach from it too:
+- **macOS**: Finder → Go → Connect to Server → `vnc://localhost:5901`
+- **anywhere**: [TigerVNC](https://tigervnc.org/) or RealVNC Viewer
+
+You'll see an empty desktop. That's normal — nothing is started yet.
+
+---
+
+## Step 5 — Start the session
+
+Back in your SSH session on the box:
 
 ```bash
+systemctl --user start fake-claude-vscode
+```
+
+Watch the VNC window. VS Code opens your project and **automatically starts
+Claude Code in its integrated terminal** — that's a `folderOpen` task the setup
+wrote into `~/project/.vscode/tasks.json`. No clicking needed.
+
+---
+
+## Step 6 — Start the auto-typing
+
+Still on the box:
+
+```bash
+cd ~/fake-claude
 tmux new -s driver
-FAKE_CLAUDE_URL=https://<your-service>.onrender.com ./cloud/keypress-linux.sh --forever
-# ctrl-b d to detach, `tmux attach -t driver` to return
 ```
 
-### Recording quality over VNC
+Inside tmux:
 
-You're recording a VNC client, not the framebuffer, so you inherit its
-compression. Two things help a lot:
+```bash
+FAKE_CLAUDE_URL=https://kickback-kick.onrender.com \
+KEYS_WINDOW='Visual Studio Code' \
+./cloud/keypress-linux.sh --forever
+```
 
-- Match your viewer window to the server geometry for 1:1 pixels. Default is
-  `1600x900`; change it with `FAKE_GEOMETRY` before running setup.sh.
-- Set the viewer's encoding to **Tight + high quality** or raw over the tunnel.
+It counts down 5 seconds, then starts typing prompts into VS Code's terminal.
 
-If you later want a pixel-perfect capture, add ffmpeg's `x11grab` back on the
-instance — it records the real framebuffer and ignores VNC entirely.
+Press **`Ctrl-b`** then **`d`** to detach from tmux. The driver keeps running.
+Come back with `tmux attach -t driver`.
 
-### Which driver?
+### What the driver does
 
-| | how | needs a screen? |
-|---|---|---|
-| `drive.sh` | spawns the CLI on its own pty via `expect` | no |
-| `cloud/keypress-linux.sh` | types into the xterm on `:1` via xdotool | yes |
+It doesn't read the CLI's output — it can't. It subscribes to the server's
+`/events` stream and reacts:
 
-Use `keypress-linux.sh` here — you want the visible desktop. `drive.sh` is the
-headless option if you ever just want a transcript.
+| server says | driver does |
+|---|---|
+| `tool_use` | waits 0.5s, presses Enter to approve the permission prompt |
+| `turn_end` | waits 3s, types the next prompt |
+
+Options:
+
+```bash
+./cloud/keypress-linux.sh --forever          # loop the built-in 10 prompts
+./cloud/keypress-linux.sh -f prompts.txt     # your own, one per line
+./cloud/keypress-linux.sh 'fix the bug'      # just these
+./cloud/keypress-linux.sh -n 5               # five passes
+```
+
+Timing knobs: `KEYS_TYPE_MIN_MS` / `KEYS_TYPE_MAX_MS` (per character),
+`KEYS_READ_SECS` (pause between turns).
 
 ---
 
-## Services
+## Step 7 — Record, then walk away
 
-All `systemctl --user`, no sudo:
+Record on **your own machine** while the VNC window is open — QuickTime,
+`Cmd-Shift-5`, OBS, whatever you use. Nothing needs to be installed on the
+instance.
 
-| unit | what |
-|---|---|
-| `fake-claude-vnc` | the X display, `:1` on `127.0.0.1:5901` |
-| `fake-claude-desktop` | openbox + screensaver/DPMS off |
-| `fake-claude-term` | xterm titled `fakeclaude` running the CLI |
-| `fake-claude-server` | **only if you didn't pass `FAKE_CLAUDE_URL`** |
+When you're done:
+
+1. Stop recording
+2. Close the VNC viewer
+3. Close the SSH tunnel
+4. Close your laptop
+
+**The run keeps going.** Reconnect tomorrow and it's still typing.
+
+For better capture quality, match your viewer window to the server resolution
+(default `1600x900` — change with `FAKE_GEOMETRY` before running setup.sh) and
+set the viewer's encoding to Tight with high quality.
+
+---
+
+## Why it survives you disconnecting
+
+Three things, all handled by setup.sh:
+
+1. **The desktop is on the server.** Xvnc is a real X display that exists
+   whether or not a viewer is attached. Your VNC client is just a window onto it.
+2. **`loginctl enable-linger`.** By default systemd destroys your entire user
+   service manager when your last SSH session ends — this is what stops it, and
+   it's the single most important line in the whole setup.
+3. **tmux** holds the driver, so closing your SSH session doesn't kill it.
+
+Verify lingering is on:
 
 ```bash
-systemctl --user status fake-claude-term
-journalctl --user -u fake-claude-term -f
+loginctl show-user $USER | grep Linger    # want: Linger=yes
 ```
 
-VNC and desktop are enabled, so they return after a reboot. The terminal is
-manual.
+---
+
+## Everyday commands
+
+```bash
+# start / stop the visible session
+systemctl --user start fake-claude-vscode
+systemctl --user stop  fake-claude-vscode
+
+# is everything up?
+systemctl --user status fake-claude-vnc fake-claude-desktop fake-claude-vscode
+
+# driver
+tmux attach -t driver        # watch it
+tmux kill-session -t driver  # stop it
+```
+
+| unit | what it is |
+|---|---|
+| `fake-claude-vnc` | the X display on `:1` |
+| `fake-claude-desktop` | window manager, screensaver off |
+| `fake-claude-vscode` | VS Code + auto-started Claude Code |
+| `fake-claude-term` | plain xterm alternative (`FAKE_VSCODE=0`) |
+
+The first two are enabled, so they return after a reboot.
 
 ---
 
 ## Troubleshooting
 
-**Everything dies when I disconnect.** Lingering didn't take. `loginctl show-user
-$USER | grep Linger` — if `no`, run `sudo loginctl enable-linger $USER`.
+**Nothing gets typed.** The driver types into whatever window has focus. Click
+the VS Code terminal once, or check `KEYS_WINDOW` matches the window title.
 
-**Keystrokes go nowhere.** The driver types into whatever window has focus on
-`:1`. If your terminal's title isn't `fakeclaude`, set `KEYS_WINDOW`.
+**VS Code opens but no terminal starts.** The automatic task was blocked. In VS
+Code: `Ctrl-Shift-P` → *Tasks: Allow Automatic Tasks* → then restart the unit.
 
-There's a subtlety worth knowing: `xdotool type --window <id>` looks like it
-should remove the focus requirement, but it sends `XSendEvent`, which terminals
-ignore by default — prompts vanish silently. The script activates the window and
-sends real XTEST events, re-asserting focus before each prompt.
+**First prompt of the day hangs ~50 seconds.** Render's free tier sleeps after
+15 minutes idle. The scripts wait it out and print `waking …`. Expected.
 
-**First launch of the day hangs ~50s.** That's the Render cold start. Expected.
+**The run stalls with the CLI sitting idle.** The `/events` stream probably
+reconnected and missed a `turn_end`. `tmux attach -t driver`, Ctrl-C, restart it.
 
-**The run stalls with the CLI idle.** Probably a dropped `turn_end` after a
-reconnect. Ctrl-C the driver and restart it.
+**Everything dies when I disconnect.** Lingering isn't on — see above.
 
-**`/events returned 404`.** That server predates the endpoint — redeploy on
-Render.
+**Black screen.** Screensaver. `DISPLAY=:1 xset s off -dpms`.
 
-**Screen is black.** X screensaver. The desktop unit runs `xset s off -dpms` and
-so does the driver, but anything you start by hand outside those needs it too.
-
-**Text is tiny.** Edit geometry/font in
-`~/.config/systemd/user/fake-claude-term.service`, then `daemon-reload` and
-restart it.
+**VS Code won't start.** Check `journalctl --user -u fake-claude-vscode -n 50`.
+Usually memory. Check `free -h` shows swap active; if you're on t3.micro, run with `FAKE_VSCODE=0`.
 
 ---
 
@@ -222,10 +276,10 @@ restart it.
 | | |
 |---|---|
 | Render free tier | **$0** |
-| `t3.small` 24/7 | ~$15/mo |
-| `t3.small` stopped | ~$0.64/mo (8 GB EBS only) |
+| t3.small running | ~$0.021/hr, ~$15/mo if left on |
+| t3.small **stopped** | ~$1/mo (just the 12 GB disk) |
+| t3.small, 4 hrs of filming | **~$0.08** |
 
-**Stop the instance when you're not filming.** EC2 bills by the second while
-running; a stopped instance only costs its disk. That's the difference between
-$15/mo and pocket change, and the desktop comes back on boot because the units
-are enabled.
+**Stop the instance in the EC2 console when you're not filming.** That's the
+difference between $15/month and a few cents. Everything comes back on start,
+because the services are enabled — you'll only need to re-run step 5 onward.
