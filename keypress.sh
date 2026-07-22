@@ -54,6 +54,15 @@ WAKE_SECS="${FAKE_CLAUDE_WAKE_SECS:-90}"
 # and an instant Enter reads as a machine.
 CONFIRM_DELAY="${KEYS_CONFIRM_DELAY:-0.5}"
 
+# How many times to press Enter at a permission prompt, and the gap between
+# presses. One shot works for a short one-liner (rg, git log) but a long or
+# multi-line command (a piped jq filter, a quoted grep, a YAML block scalar)
+# takes longer to render into the box — a single blind Enter can land before
+# the dialog has focus, or get dropped entirely. Repeating is safe: extra
+# Enters against a plain shell prompt are no-ops (blank lines).
+CONFIRM_RETRIES="${KEYS_CONFIRM_RETRIES:-3}"
+CONFIRM_RETRY_GAP="${KEYS_CONFIRM_RETRY_GAP:-1}"
+
 # Pause after a turn finishes before typing the next prompt — reading time.
 READ_SECS="${KEYS_READ_SECS:-3}"
 
@@ -394,9 +403,12 @@ while true; do
     *'"ping"'*|*'"hello"'*)
       continue ;;
     *'"tool_use"'*)
-      note "tool call — permission prompt incoming, Enter in ${CONFIRM_DELAY}s"
+      note "tool call — permission prompt incoming, Enter in ${CONFIRM_DELAY}s (x${CONFIRM_RETRIES})"
       sleep "$CONFIRM_DELAY"
-      press_enter
+      for (( i = 0; i < CONFIRM_RETRIES; i++ )); do
+        press_enter
+        [ "$i" -lt "$(( CONFIRM_RETRIES - 1 ))" ] && sleep "$CONFIRM_RETRY_GAP"
+      done
       ;;
     *'"turn_end"'*)
       idx=$(( idx + 1 ))

@@ -193,7 +193,10 @@ Options:
 ```
 
 Timing knobs: `KEYS_TYPE_MIN_MS` / `KEYS_TYPE_MAX_MS` (per character),
-`KEYS_READ_SECS` (pause between turns).
+`KEYS_READ_SECS` (pause between turns), `KEYS_CONFIRM_RETRIES` /
+`KEYS_CONFIRM_RETRY_GAP` (repeat Enter at a permission prompt — a long or
+multi-line command's box can take longer to render than one blind keypress
+accounts for, especially over VNC).
 
 ---
 
