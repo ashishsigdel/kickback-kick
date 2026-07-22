@@ -40,9 +40,15 @@ if [ "${KEYS_CAFFEINATE:-1}" != "0" ] && [ -z "${KEYS_CAFFEINATED:-}" ] \
   exec caffeinate -dimsu "${BASH_SOURCE[0]}" ${@+"$@"}
 fi
 
-HOST="${FAKE_HOST:-127.0.0.1}"
-PORT="${FAKE_PORT:-8787}"
-EVENTS_URL="http://$HOST:$PORT/events"
+# Same var fakeclaude uses, so pointing both scripts at a hosted server is one
+# env var instead of two. FAKE_HOST/FAKE_PORT still work for plain local runs.
+BASE_URL="${FAKE_CLAUDE_URL:-http://${FAKE_HOST:-127.0.0.1}:${FAKE_PORT:-8787}}"
+EVENTS_URL="$BASE_URL/events"
+
+# A free-tier Render service sleeps after ~15 minutes idle and needs the better
+# part of a minute to wake — a 2s check would always report "no server" on the
+# first run of the day. Same wait fakeclaude does.
+WAKE_SECS="${FAKE_CLAUDE_WAKE_SECS:-90}"
 
 # Pause before answering a permission prompt — the box needs a moment to render,
 # and an instant Enter reads as a machine.
@@ -105,11 +111,28 @@ fi
 
 note() { printf '\n\033[2m--- keys: %s\033[0m\n' "$1"; }
 
-if ! curl -fsS --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
-  echo "keypress.sh: no mock server on $HOST:$PORT" >&2
-  echo "             start one with:  uv run mock_server.py" >&2
-  exit 1
-fi
+# Blocks until $BASE_URL/health answers, waiting out a Render free-tier cold
+# start if needed. Used at startup, and again if the events stream drops and
+# it turns out the server itself went away rather than just the connection.
+wait_for_health() {
+  curl -fsS --max-time 5 "$BASE_URL/health" >/dev/null 2>&1 && return 0
+  printf 'keypress.sh: waking %s (up to %ss)' "$BASE_URL" "$WAKE_SECS" >&2
+  deadline=$(( SECONDS + WAKE_SECS ))
+  until curl -fsS --max-time 10 "$BASE_URL/health" >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      printf '\n' >&2
+      echo "keypress.sh: no mock server at $BASE_URL" >&2
+      echo "             local:  uv run mock_server.py" >&2
+      echo "             hosted: check the service is live in the Render dashboard" >&2
+      exit 1
+    fi
+    printf '.' >&2
+    sleep 2
+  done
+  printf '\n' >&2
+}
+
+wait_for_health
 
 # /events is what drives this script. A server started before it existed answers
 # 404 — a restart is the fix, and it's worth saying so plainly.
@@ -227,10 +250,21 @@ sleep 5
 # --- event loop --------------------------------------------------------------
 # One long-lived connection for the whole run. The turn index lives here: each
 # turn_end advances to the next prompt, each tool_use just answers the box.
-EVENTS_FIFO="$(mktemp -u)"
-mkfifo "$EVENTS_FIFO"
-curl -fsS -N "$EVENTS_URL" > "$EVENTS_FIFO" &
-CURL_PID=$!
+#
+# connect_events opens a fresh fifo/curl/fd 3 each call, so a dropped
+# connection (Render free-tier reset, network blip) can be re-established
+# without losing idx/cycle — see the reconnect branch in the read loop below.
+connect_events() {
+  EVENTS_FIFO="$(mktemp -u)"
+  mkfifo "$EVENTS_FIFO"
+  curl -fsS -N "$EVENTS_URL" > "$EVENTS_FIFO" 2>/dev/null &
+  CURL_PID=$!
+  exec 3<"$EVENTS_FIFO"
+}
+
+# Attach to the stream *before* typing anything, so the subscription is live by
+# the time the first turn ends — opening the fifo is what lets curl connect.
+connect_events
 trap 'kill "$CURL_PID" 2>/dev/null || true; rm -f "$EVENTS_FIFO"' EXIT
 trap 'echo; note "interrupted — stopping"; exit 130' INT TERM
 
@@ -246,14 +280,25 @@ send_prompt() {
   press_enter
 }
 
-# Attach to the stream *before* typing anything, so the subscription is live by
-# the time the first turn ends — opening the fifo is what lets curl connect.
-exec 3<"$EVENTS_FIFO"
-
 # Kick off the first prompt; everything after it is event-driven.
 send_prompt
 
-while IFS= read -r line <&3; do
+while true; do
+  if ! IFS= read -r line <&3; then
+    # curl exited — the connection reset from under us (Render free-tier and
+    # similar hosts do this on long-lived streams). Reconnect instead of
+    # letting the whole run die silently. wait_for_health absorbs a server
+    # restart, and exits the script itself if it never comes back within
+    # WAKE_SECS.
+    note "events stream dropped — reconnecting"
+    exec 3<&-
+    kill "$CURL_PID" 2>/dev/null || true
+    rm -f "$EVENTS_FIFO"
+    sleep 2
+    wait_for_health
+    connect_events
+    continue
+  fi
   # Matched on the quoted event name alone, so JSON spacing can't break this.
   case "$line" in
     *'"ping"'*|*'"hello"'*)

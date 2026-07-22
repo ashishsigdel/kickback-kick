@@ -274,8 +274,11 @@ Code: `Ctrl-Shift-P` → _Tasks: Allow Automatic Tasks_ → then restart the uni
 **First prompt of the day hangs ~50 seconds.** Render's free tier sleeps after
 15 minutes idle. The scripts wait it out and print `waking …`. Expected.
 
-**The run stalls with the CLI sitting idle.** The `/events` stream probably
-reconnected and missed a `turn_end`. `tmux attach -t driver`, Ctrl-C, restart it.
+**The run stalls with the CLI sitting idle.** `keypress.sh` reconnects on its
+own when the `/events` stream drops (look for `events stream dropped —
+reconnecting` in its output) — but a reconnect can land after a `turn_end` it
+missed, in which case the driver is waiting on an event that already happened.
+`tmux attach -t driver`, Ctrl-C, restart it.
 
 **Everything dies when I disconnect.** Lingering isn't on — see above.
 
