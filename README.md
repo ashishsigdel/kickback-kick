@@ -456,6 +456,45 @@ The floor under `KEYS_STALL_SECS` is the longest legitimate silence, which is a
 tool call: the CLI allows a command up to 120s before timing it out, and the
 server thinks for another 5-7s once the result lands.
 
+### Pacing
+
+Every pause in a run is a range, not a constant — a fresh value is drawn each
+time it is used, because a driver that waits exactly the same number of seconds
+at every step is the thing that reads as scripted on a recording. Set both ends
+of a range to the same number to pin it.
+
+| Variable                                              | Default    | What it paces                                     |
+| ----------------------------------------------------- | ---------- | ------------------------------------------------- |
+| `THINK_MIN_MS` / `THINK_MAX_MS`                        | `5000`/`7000` | Server-side thinking pause before each response |
+| `KEYS_TYPE_MIN_MS` / `KEYS_TYPE_MAX_MS`                | `30`/`190` | Gap between typed characters (~110 WPM)           |
+| `KEYS_TYPE_SPEED_MIN` / `KEYS_TYPE_SPEED_MAX`          | `0.7`/`1.4`| Multiplier on that range, drawn once per prompt    |
+| `KEYS_PAUSE_CHANCE`, `KEYS_PAUSE_MIN_SECS` / `KEYS_PAUSE_MAX_SECS` | `0.12`, `0.3`/`1.4` | Hesitation after a space or punctuation |
+| `KEYS_ENTER_MIN_SECS` / `KEYS_ENTER_MAX_SECS`          | `0.4`/`2.5`| Typing finished → Enter pressed                   |
+| `KEYS_READ_MIN_SECS` / `KEYS_READ_MAX_SECS`            | `3`/`8`    | Turn ends → next prompt typed                     |
+| `KEYS_CYCLE_PAUSE_MIN_SECS` / `KEYS_CYCLE_PAUSE_MAX_SECS` | `2`/`15` | End of the prompt list → restart from the top   |
+
+All of them live in `.env`. The `THINK_*` pair is read there by the server via
+python-dotenv; the `KEYS_*` values are read from the same file by `keypress.sh`
+and `cloud/keypress-linux.sh`, which parse it as data rather than sourcing it —
+only `KEY=VALUE` lines with a shell-safe name are taken and no value is ever
+evaluated. Anything already in the environment wins, so a one-off run can still
+override the file:
+
+```sh
+KEYS_READ_MIN_SECS=10 KEYS_READ_MAX_SECS=30 ./keypress.sh --forever
+```
+
+The older single-value `KEYS_READ_SECS` and `KEYS_CYCLE_PAUSE_SECS` still work
+and pin both ends of their range.
+
+The last two rows are there because per-character jitter alone is not enough.
+Over a 60-character prompt the draws average out, so every prompt lands at the
+same words-per-minute even though no two keystrokes match — the variance is
+visible in the gaps and absent in the totals, which is not what typing looks
+like. `KEYS_TYPE_SPEED_*` scales the whole range once per prompt, which spreads
+those totals (measured across six prompts: 74, 99, 77, 116, 108, 84 WPM), and
+`KEYS_PAUSE_*` puts the composing pauses back at word and clause boundaries.
+
 ## Logging
 
 Every request prints one readable line to stdout — method, path, model, last

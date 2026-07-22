@@ -34,6 +34,34 @@ set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Read the same .env the server reads, so every knob in the project lives in one
+# file. Only KEY=VALUE lines with a shell-safe name are taken and the value is
+# never evaluated — this file is data, not a script to source. Anything already
+# in the environment wins, so `KEYS_READ_MAX_SECS=20 ./keypress.sh` still
+# overrides the file for one run.
+load_env_file() {
+  local file="$1" line key value
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+      [A-Za-z_]*=*) ;;
+      *) continue ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    value="${value%$'\r'}"
+    # Strip one layer of matching quotes; unquoted values keep any inline #.
+    case "$value" in
+      \"*\") value="${value%\"}"; value="${value#\"}" ;;
+      \'*\') value="${value%\'}"; value="${value#\'}" ;;
+    esac
+    [ -n "${!key+set}" ] && continue
+    export "$key=$value"
+  done < "$file"
+}
+load_env_file "$BASE_DIR/.env"
+
 # Keep the machine and the display awake for as long as the driver runs.
 # caffeinate holds its assertions for the lifetime of the utility it launches,
 # so re-executing ourselves under it means the guard is released when we exit —
@@ -82,16 +110,40 @@ CONFIRM_DELAY="${KEYS_CONFIRM_DELAY:-0.5}"
 CONFIRM_RETRIES="${KEYS_CONFIRM_RETRIES:-3}"
 CONFIRM_RETRY_GAP="${KEYS_CONFIRM_RETRY_GAP:-1}"
 
-# Pause after a turn finishes before typing the next prompt — reading time.
-READ_SECS="${KEYS_READ_SECS:-3}"
+# Pause after a turn finishes before typing the next prompt — reading time. A
+# range in seconds; a fresh value is drawn every time. Set both to the same
+# number for a constant.
+READ_MIN_SECS="${KEYS_READ_MIN_SECS:-${KEYS_READ_SECS:-3}}"
+READ_MAX_SECS="${KEYS_READ_MAX_SECS:-${KEYS_READ_SECS:-8}}"
+
+# Pause between finishing the typing of a prompt and pressing Enter — the beat
+# where a person re-reads what they just wrote. Range in seconds.
+ENTER_MIN_SECS="${KEYS_ENTER_MIN_SECS:-0.4}"
+ENTER_MAX_SECS="${KEYS_ENTER_MAX_SECS:-2.5}"
 
 # Per-character typing delay, in milliseconds. A range, not a constant, so the
 # cadence stays human. This is the *whole* gap now — see type_text().
-TYPE_MIN_MS="${KEYS_TYPE_MIN_MS:-5}"
-TYPE_MAX_MS="${KEYS_TYPE_MAX_MS:-14}"
+TYPE_MIN_MS="${KEYS_TYPE_MIN_MS:-30}"
+TYPE_MAX_MS="${KEYS_TYPE_MAX_MS:-190}"
 
-# Pause between one pass over the prompt list and the next, in seconds.
-CYCLE_PAUSE="${KEYS_CYCLE_PAUSE_SECS:-2}"
+# Multiplier applied to that whole range once per prompt, so prompts differ from
+# each other and not just character to character. 0.7 is a brisk one, 1.4 a
+# distracted one. Both ends 1 turns it off.
+TYPE_SPEED_MIN="${KEYS_TYPE_SPEED_MIN:-0.7}"
+TYPE_SPEED_MAX="${KEYS_TYPE_SPEED_MAX:-1.4}"
+
+# Hesitation at word and clause boundaries: the chance (0-1) that a space or
+# punctuation mark is followed by a longer pause instead of the usual gap, and
+# how long that pause runs in seconds. This is where composing the next phrase
+# shows up on a recording. Chance 0 turns it off.
+PAUSE_CHANCE="${KEYS_PAUSE_CHANCE:-0.12}"
+PAUSE_MIN_SECS="${KEYS_PAUSE_MIN_SECS:-0.3}"
+PAUSE_MAX_SECS="${KEYS_PAUSE_MAX_SECS:-1.4}"
+
+# Pause between one pass over the prompt list and the next, in seconds. Range,
+# drawn fresh at the end of every cycle.
+CYCLE_PAUSE_MIN_SECS="${KEYS_CYCLE_PAUSE_MIN_SECS:-${KEYS_CYCLE_PAUSE_SECS:-2}}"
+CYCLE_PAUSE_MAX_SECS="${KEYS_CYCLE_PAUSE_MAX_SECS:-${KEYS_CYCLE_PAUSE_SECS:-15}}"
 
 # How long to sit with no tool_use and no turn_end before deciding the turn was
 # missed and moving on anyway. This is what keeps an unattended run alive: every
@@ -336,6 +388,23 @@ osa() {
   fi
 }
 
+# A random number of seconds between two bounds, two decimals. $RANDOM rather
+# than awk's rand(): awk seeded from the clock returns the same value for calls
+# inside the same second, which is exactly how these are used (type, pause,
+# type again) and would quietly make every draw in a burst identical.
+rand_secs() {
+  awk -v lo="$1" -v hi="$2" -v r="$RANDOM" \
+    'BEGIN { if (hi < lo) hi = lo; printf "%.2f", lo + (hi - lo) * (r / 32767) }'
+}
+
+# Draw and sleep, echoing the value back so callers can log what they waited.
+rand_sleep() {
+  local secs
+  secs="$(rand_secs "$1" "$2")"
+  sleep "$secs"
+  printf '%s' "$secs"
+}
+
 press_enter() {
   jiggle_mouse
   osa -e 'tell application "System Events" to key code 36' || true
@@ -364,27 +433,49 @@ scroll_mouse() {
 # per prompt instead of one per character: process spawn is ~40ms, which used
 # to dominate the delay and put a floor under how fast typing could go.
 # Text and timings arrive as arguments, so there's no quoting to escape.
+#
+# Two things here are not just jitter. Uniform noise around a fixed mean is not
+# what typing looks like: over a 60-character prompt the per-character draws
+# average out, so every prompt lands at exactly the same words-per-minute even
+# though no two keystrokes match. Real typing varies *between* prompts as much
+# as within them, and it stalls at word and clause boundaries where the next
+# phrase gets composed. So the caller scales the whole range by a per-prompt
+# speed factor, and the loop below rolls for a longer pause after the characters
+# people actually pause after.
 TYPE_SCRIPT='on run argv
 	set t to item 1 of argv
 	set lo to (item 2 of argv) as real
 	set hi to (item 3 of argv) as real
+	set pauseChance to (item 4 of argv) as real
+	set pauseLo to (item 5 of argv) as real
+	set pauseHi to (item 6 of argv) as real
+	set breakChars to " ,.;:!?"
 	tell application "System Events"
 		repeat with i from 1 to (count of characters of t)
-			keystroke (character i of t)
-			delay (random number from lo to hi)
+			set c to (character i of t)
+			keystroke c
+			if (breakChars contains c) and (random number) < pauseChance then
+				delay (random number from pauseLo to pauseHi)
+			else
+				delay (random number from lo to hi)
+			end if
 		end repeat
 	end tell
 end run'
 
 type_text() {
-  # Milliseconds to the decimal seconds AppleScript's `delay` wants. Built with
-  # printf rather than awk: the `"$(awk "… \"%.4f\" …")"` form this replaces is
-  # mis-parsed by bash 3.2 — still what /bin/bash is on macOS — which dropped
-  # the format string and left `delay` with an empty argument.
-  local lo hi
-  printf -v lo '%d.%03d' $(( TYPE_MIN_MS / 1000 )) $(( TYPE_MIN_MS % 1000 ))
-  printf -v hi '%d.%03d' $(( TYPE_MAX_MS / 1000 )) $(( TYPE_MAX_MS % 1000 ))
-  osa -e "$TYPE_SCRIPT" "$1" "$lo" "$hi" || true
+  # One speed factor for the whole prompt — this one typed briskly, the next
+  # while half-attending to something else. Without it the law of large numbers
+  # flattens every prompt to the same average rate.
+  local factor lo hi
+  factor="$(rand_secs "$TYPE_SPEED_MIN" "$TYPE_SPEED_MAX")"
+  # Scaled milliseconds to the decimal seconds AppleScript's `delay` wants.
+  # awk does the arithmetic because the factor is fractional; the printf form
+  # this replaces could only handle integer milliseconds.
+  lo="$(awk -v ms="$TYPE_MIN_MS" -v f="$factor" 'BEGIN { printf "%.4f", ms * f / 1000 }')"
+  hi="$(awk -v ms="$TYPE_MAX_MS" -v f="$factor" 'BEGIN { printf "%.4f", ms * f / 1000 }')"
+  osa -e "$TYPE_SCRIPT" "$1" "$lo" "$hi" \
+      "$PAUSE_CHANCE" "$PAUSE_MIN_SECS" "$PAUSE_MAX_SECS" || true
 }
 
 # Fail before the countdown rather than halfway through the first prompt.
@@ -438,7 +529,7 @@ awaiting=0    # $SECONDS when the driver last had something to wait for
 clear_context() {
   note "clearing the CLI conversation (every ${CLEAR_EVERY} prompts)"
   type_text "/clear"
-  sleep 0.4
+  rand_sleep "$ENTER_MIN_SECS" "$ENTER_MAX_SECS" >/dev/null
   press_enter
   sleep 1.5
 }
@@ -451,7 +542,7 @@ send_prompt() {
   note "prompt $((idx + 1))/${#PROMPTS[@]}: $prompt"
   jiggle_mouse
   type_text "$prompt"
-  sleep 0.4
+  rand_sleep "$ENTER_MIN_SECS" "$ENTER_MAX_SECS" >/dev/null
   press_enter
   sent=$(( sent + 1 ))
   awaiting=$SECONDS
@@ -469,11 +560,16 @@ advance_and_send() {
       return 1
     fi
     cycle=$(( cycle + 1 ))
-    note "cycle $cycle — pausing ${CYCLE_PAUSE}s"
-    sleep "$CYCLE_PAUSE"
+    local pause
+    pause="$(rand_secs "$CYCLE_PAUSE_MIN_SECS" "$CYCLE_PAUSE_MAX_SECS")"
+    note "cycle $cycle — pausing ${pause}s"
+    sleep "$pause"
   else
     scroll_mouse
-    sleep "$READ_SECS"
+    local read_pause
+    read_pause="$(rand_secs "$READ_MIN_SECS" "$READ_MAX_SECS")"
+    note "reading for ${read_pause}s before the next prompt"
+    sleep "$read_pause"
   fi
   send_prompt
 }

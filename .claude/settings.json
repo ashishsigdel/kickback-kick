@@ -1,6 +1,6 @@
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "",
+    "ANTHROPIC_BASE_URL": "https://kickback-kick.onrender.com",
     "ANTHROPIC_MODEL": "claude-opus-4-8"
   },
   "permissions": {
