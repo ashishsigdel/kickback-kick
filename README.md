@@ -163,7 +163,7 @@ entirely.
 
 > Because the token is unset, the CLI sends your real claude.ai credentials to
 > `127.0.0.1:8787`. They go nowhere else and the server never logs headers —
-> only request bodies land in `logs/`. If you'd rather not send them at all, set
+> only request bodies, and only if `FAKE_LOG_BODIES=1`. If you'd rather not send them at all, set
 > `FAKE_CLAUDE_TOKEN=dummy` and accept the warning banner. If you aren't logged
 > in, that variable is how you supply a token.
 
@@ -431,11 +431,43 @@ is the `xdotool` port of `keypress.sh` for X.
 URL and defaults to `http://127.0.0.1:8787`, so the same commands run locally or
 against a hosted server.
 
+### Surviving a long run
+
+Both `keypress.sh` and `cloud/keypress-linux.sh` act only on what `/events`
+tells them, and those events are delivered live — whatever is published while
+the stream is down is gone. Across the internet the stream *will* drop: a
+free-tier host restarts, a connection resets, a cold start takes a minute. A
+driver that simply waited for the next event would stop typing at the first one
+of those and look exactly like a run that had finished.
+
+| Variable            | Default | Meaning                                                        |
+| ------------------- | ------- | -------------------------------------------------------------- |
+| `KEYS_STALL_SECS`   | `240`   | Silence after which the driver assumes it missed a turn and moves on |
+| `KEYS_POLL_SECS`    | `5`     | How often it wakes to check that deadline                       |
+| `KEYS_CLEAR_EVERY`  | `10`    | Type `/clear` every N prompts; `0` never clears                 |
+
+`KEYS_CLEAR_EVERY` is about size, not tidiness. The CLI resends the entire
+transcript on every request, so an uncleared run grows without bound — over a
+megabyte per request by the end of a long session, re-uploaded and re-parsed
+every turn. Clearing periodically keeps it flat, and reads on a recording as
+moving on to a fresh task.
+
+The floor under `KEYS_STALL_SECS` is the longest legitimate silence, which is a
+tool call: the CLI allows a command up to 120s before timing it out, and the
+server thinks for another 5-7s once the result lands.
+
 ## Logging
 
 Every request prints one readable line to stdout — method, path, model, last
-user message, stream flag, session id, and time remaining. Full request bodies
-are dumped to `logs/` as timestamped JSON for inspection.
+user message, stream flag, session id, and time remaining.
+
+Full request bodies can also be dumped to `logs/` as timestamped JSON, but that
+is off unless you set `FAKE_LOG_BODIES=1`, and it is not something to leave on
+for a long run. The CLI resends the whole transcript on every request, so bodies
+grow with the conversation — a few hundred KB early, over a megabyte by the end
+— and there is one file per request. An unattended overnight run produced 140MB
+in six hours. On a host with a small ephemeral disk that ends as a failed write
+mid-session, which the CLI sees as a 500.
 
 ## Getting back to normal
 

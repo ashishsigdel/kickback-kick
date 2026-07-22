@@ -85,7 +85,7 @@ fi
 command -v expect >/dev/null 2>&1 || { echo "drive.sh: 'expect' not found on PATH." >&2; exit 127; }
 [ -x "$LAUNCHER" ] || { echo "drive.sh: $LAUNCHER not found or not executable." >&2; exit 1; }
 
-BASE_URL="${FAKE_CLAUDE_URL:-http://127.0.0.1:8787}"
+BASE_URL="${FAKE_CLAUDE_URL:-https://kickback-kick.onrender.com}"
 
 # Same cold-start allowance as fakeclaude — a sleeping free-tier host answers
 # nothing for the first ~50s, and this preflight runs before the launcher gets

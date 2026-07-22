@@ -14,6 +14,11 @@
 #   tool_use  -> a permission prompt is about to appear -> wait, press Enter
 #   turn_end  -> the response finished                  -> wait, type the next prompt
 #
+# Events are delivered live, so anything published while the stream was down is
+# gone for good. That makes a missed turn_end indistinguishable from a turn that
+# never ended, which is why nothing here blocks forever: KEYS_STALL_SECS bounds
+# how long the driver waits before assuming it missed one and moving on.
+#
 # Keys are real X input events via xdotool's XTEST calls, one character at a
 # time with a jittered gap, so it looks like someone typing. They go to whatever
 # window has focus on $DISPLAY, which is why this activates the target window
@@ -35,11 +40,18 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # get this wrong and xdotool types into a different desktop, or none at all.
 export DISPLAY="${DISPLAY:-:1}"
 
-# The server may not be on this machine. FAKE_CLAUDE_URL is a full base URL so
-# it can name an https host — assembling one from host+port the way the macOS
-# script does can only ever produce http, which a hosted server won't answer on.
-# FAKE_HOST/FAKE_PORT still work for a local server.
-BASE_URL="${FAKE_CLAUDE_URL:-http://${FAKE_HOST:-127.0.0.1}:${FAKE_PORT:-8787}}"
+# The server is hosted, so that is the default. FAKE_CLAUDE_URL is a full base
+# URL so it can name an https host — assembling one from host+port can only ever
+# produce http, which a hosted server won't answer on. FAKE_HOST/FAKE_PORT still
+# select a local server, but only when set explicitly.
+DEFAULT_URL="https://kickback-kick.onrender.com"
+if [ -n "${FAKE_CLAUDE_URL:-}" ]; then
+  BASE_URL="$FAKE_CLAUDE_URL"
+elif [ -n "${FAKE_HOST:-}" ] || [ -n "${FAKE_PORT:-}" ]; then
+  BASE_URL="http://${FAKE_HOST:-127.0.0.1}:${FAKE_PORT:-8787}"
+else
+  BASE_URL="$DEFAULT_URL"
+fi
 BASE_URL="${BASE_URL%/}"
 EVENTS_URL="$BASE_URL/events"
 
@@ -73,6 +85,28 @@ TYPE_MAX_MS="${KEYS_TYPE_MAX_MS:-14}"
 # Pause between one pass over the prompt list and the next, in seconds.
 CYCLE_PAUSE="${KEYS_CYCLE_PAUSE_SECS:-2}"
 
+# How long to sit with no tool_use and no turn_end before deciding the turn was
+# missed and moving on anyway. This is what keeps an unattended run alive: every
+# event is delivered live to whoever is subscribed at that instant, so anything
+# published while the stream was down is simply gone, and without a deadline the
+# driver waits for it forever. A run that stops three hours in looks exactly
+# like a run that finished.
+#
+# The floor is set by the longest legitimate silence, which is a tool call: the
+# CLI gives a command up to 120s before it times out, and the server thinks for
+# another 5-7s after the result comes back. 240 clears that with room to spare.
+STALL_SECS="${KEYS_STALL_SECS:-240}"
+
+# How often the read loop wakes up to check that deadline.
+POLL_SECS="${KEYS_POLL_SECS:-5}"
+
+# Clear the CLI's conversation every N prompts; 0 never clears. The CLI resends
+# the entire transcript on every request, so an uncleared run grows without
+# bound — bodies were over a megabyte by the end of a long session, and every
+# turn re-uploads and re-parses all of it. Clearing periodically keeps requests
+# small, and reads on a recording as moving on to a fresh task.
+CLEAR_EVERY="${KEYS_CLEAR_EVERY:-10}"
+
 # Small mouse moves/scrolls around typing and Enter, purely cosmetic — a cursor
 # that never twitches while text appears is the one thing that reads as fake on
 # a recording. xdotool already handles the keystrokes, so no new dependency.
@@ -87,7 +121,7 @@ while [ $# -gt 0 ]; do
     -f|--file) PROMPT_FILE="${2:?-f needs a path}"; shift 2 ;;
     --forever) CYCLES="forever"; shift ;;
     -n|--cycles) CYCLES="${2:?--cycles needs a number}"; shift 2 ;;
-    -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed -e 's/^#//' -e 's/^ //'; exit 0 ;;
+    -h|--help) sed -n '2,34p' "${BASH_SOURCE[0]}" | sed -e 's/^#//' -e 's/^ //'; exit 0 ;;
     *) PROMPTS+=("$1"); shift ;;
   esac
 done
@@ -225,18 +259,25 @@ fi
 # restart look the same from here, and blindly retrying curl every 2s against a
 # host that's still waking up just produces a wall of connection errors instead
 # of actually waiting the cold start out.
+#
+# Returns non-zero rather than exiting when the deadline passes — the caller
+# decides. At startup a dead server is fatal; mid-run it is not, and this used
+# to `exit 1` from inside the reconnect subshell, which killed the writer end of
+# the events fifo and ended the whole run. A Render cold start can take longer
+# than WAKE_SECS on its own, so that was a routine outage turning into a
+# permanent stop.
 WAKE_SECS="${FAKE_CLAUDE_WAKE_SECS:-90}"
 wait_for_health() {
   curl -fsS --max-time 5 "$BASE_URL/health" >/dev/null 2>&1 && return 0
   printf 'keypress-linux.sh: waking %s (up to %ss)' "$BASE_URL" "$WAKE_SECS" >&2
-  deadline=$(( SECONDS + WAKE_SECS ))
+  local deadline=$(( SECONDS + WAKE_SECS ))
   until curl -fsS --max-time 10 "$BASE_URL/health" >/dev/null 2>&1; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       printf '\n' >&2
       echo "keypress-linux.sh: no mock server at $BASE_URL" >&2
       echo "                   local:  uv run mock_server.py" >&2
       echo "                   hosted: check the service is live in Render" >&2
-      exit 1
+      return 1
     fi
     printf '.' >&2
     sleep 2
@@ -244,7 +285,7 @@ wait_for_health() {
   printf ' up\n' >&2
 }
 
-wait_for_health
+wait_for_health || exit 1
 
 # /events is what drives this script. A server started before it existed answers
 # 404 — a restart is the fix, and it's worth saying so plainly.
@@ -280,21 +321,27 @@ fi
 # ignore synthetic events by default (xterm needs allowSendEvents, most others
 # have no opt-in at all). Prompts would silently vanish. So: activate once, send
 # real events after.
+#
+# Nothing in here is fatal on its own. Every xdotool call is one round trip to
+# an X server that a reconnecting VNC client can disturb, and under `set -e` a
+# single transient failure would end an otherwise healthy run — the same class
+# of silent stop this script exists to avoid. A dropped keystroke costs one
+# prompt; the stall watchdog picks the run back up.
 focus_target() {
   local id
   id="$(xdotool search --onlyvisible --name "$WINDOW_NAME" 2>/dev/null | head -n1)" || true
   if [ -z "$id" ]; then
     echo "keypress-linux.sh: no visible window matching '$WINDOW_NAME' on $DISPLAY" >&2
     echo "                   set KEYS_WINDOW to match your terminal's title" >&2
-    exit 1
+    return 1
   fi
-  xdotool windowactivate --sync "$id" 2>/dev/null || xdotool windowfocus "$id"
+  xdotool windowactivate --sync "$id" 2>/dev/null || xdotool windowfocus "$id" 2>/dev/null || true
   WINDOW_ID="$id"
 }
 
 press_enter() {
   jiggle_mouse
-  xdotool key --clearmodifiers Return
+  xdotool key --clearmodifiers Return 2>/dev/null || true
 }
 
 # Small relative move, a few px in any direction — enough to register as
@@ -328,18 +375,23 @@ scroll_mouse() {
 # `type` consumes every remaining argument as more text, so a trailing `sleep`
 # in the same command gets typed out literally instead of run.
 type_text() {
-  local text="$1" i ch ms
+  local text="$1" i ch ms secs
   for (( i = 0; i < ${#text}; i++ )); do
     ch="${text:i:1}"
     # --clearmodifiers so a stuck Shift from an earlier key can't uppercase the
     # run, and -- so a leading '-' in a prompt isn't read as an option.
-    xdotool type --clearmodifiers --delay 0 -- "$ch"
+    xdotool type --clearmodifiers --delay 0 -- "$ch" 2>/dev/null || true
     ms=$(( RANDOM % (TYPE_MAX_MS - TYPE_MIN_MS + 1) + TYPE_MIN_MS ))
-    sleep "$(awk "BEGIN{printf \"%.4f\", $ms/1000}")"
+    # Milliseconds to a decimal `sleep` argument without shelling out to awk
+    # once per character. The awk form this replaces also tripped a bash 3.2
+    # parser bug with escaped quotes inside a command substitution, which made
+    # the script silently untestable on a Mac.
+    printf -v secs '%d.%03d' $(( ms / 1000 )) $(( ms % 1000 ))
+    sleep "$secs"
   done
 }
 
-focus_target
+focus_target || exit 1
 note "typing into window $WINDOW_ID ('$WINDOW_NAME') on $DISPLAY"
 [ "$MOUSE_ACTIVITY" = "1" ] && note "mouse activity on" || note "mouse activity off (KEYS_MOUSE_ACTIVITY=0)"
 note "starting in 5s"
@@ -348,89 +400,174 @@ sleep 5
 # --- event loop --------------------------------------------------------------
 # One long-lived connection for the whole run. The turn index lives here: each
 # turn_end advances to the next prompt, each tool_use just answers the box.
-EVENTS_FIFO="$(mktemp -u)"
-mkfifo "$EVENTS_FIFO"
+EVENTS_FIFO=""
+SSE_PID=""
+
+stop_events() {
+  exec 3<&- 2>/dev/null || true
+  if [ -n "$SSE_PID" ]; then
+    pkill -P "$SSE_PID" 2>/dev/null || true
+    kill "$SSE_PID" 2>/dev/null || true
+  fi
+  [ -n "$EVENTS_FIFO" ] && rm -f "$EVENTS_FIFO"
+  SSE_PID=""
+}
 
 # Reconnect rather than exit. Over localhost the stream only ends when the
-# server does, so the macOS script can let curl's exit end the run. Across the
-# internet it also ends on a dropped connection or a free-tier host restarting,
-# and a run that silently stops three hours in looks exactly like a run that
-# finished.
+# server does. Across the internet it also ends on a dropped connection or a
+# free-tier host restarting, and a run that silently stops three hours in looks
+# exactly like a run that finished.
 #
 # wait_for_health runs before each reconnect attempt so a Render free-tier
-# restart turns into one visible wait instead of a curl failure every 2s.
-# stderr is dropped on the curl call itself — the printf below is the one
-# message this produces, instead of raw "curl: (56) Recv failure" noise. The
-# `|| true` matters under set -e: without it, curl's exit status on the very
-# first drop would kill this subshell for good instead of looping.
+# restart turns into one visible wait instead of a curl failure every 2s. Its
+# return value is deliberately ignored: however long the server stays down, this
+# loop keeps trying. stderr is dropped on the curl call itself — the printf
+# below is the one message this produces, instead of raw "curl: (56) Recv
+# failure" noise. The `|| true` matters under set -e: without it, curl's exit
+# status on the very first drop would kill this subshell for good instead of
+# looping.
 #
 # The gap is not free: events emitted while disconnected are gone, and a missed
-# turn_end leaves the driver waiting for something that already happened. If a
-# run stalls with the CLI plainly idle, that's this — Ctrl-C and restart.
-(
-  while true; do
-    curl -fsS -N "$EVENTS_URL" 2>/dev/null || true
-    printf '\n\033[2m--- keys: events stream dropped — reconnecting\033[0m\n' >&2
-    sleep 2
-    wait_for_health
-  done
-) > "$EVENTS_FIFO" &
-SSE_PID=$!
-trap 'pkill -P "$SSE_PID" 2>/dev/null || true; kill "$SSE_PID" 2>/dev/null || true; rm -f "$EVENTS_FIFO"' EXIT
+# turn_end leaves the driver waiting for something that already happened. That
+# is what the stall watchdog in the read loop is for.
+start_events() {
+  EVENTS_FIFO="$(mktemp -u)"
+  mkfifo "$EVENTS_FIFO"
+  (
+    while true; do
+      curl -fsS -N "$EVENTS_URL" 2>/dev/null || true
+      printf '\n\033[2m--- keys: events stream dropped — reconnecting\033[0m\n' >&2
+      sleep 2
+      wait_for_health || true
+    done
+  ) > "$EVENTS_FIFO" &
+  SSE_PID=$!
+  # Opening the read end is what lets the subshell's curl connect.
+  exec 3<"$EVENTS_FIFO"
+}
+
+trap 'stop_events' EXIT
 trap 'echo; note "interrupted — stopping"; exit 130' INT TERM
 
 cycle=1
 idx=0
+sent=0        # prompts typed so far, for the /clear cadence
+awaiting=0    # $SECONDS when the driver last had something to wait for
+
+# /clear is handled entirely inside the CLI: it sends no request, so no turn_end
+# follows it. It has to happen inline here, never as a state the read loop then
+# waits on.
+clear_context() {
+  note "clearing the CLI conversation (every ${CLEAR_EVERY} prompts)"
+  type_text "/clear"
+  sleep 0.4
+  press_enter
+  sleep 1.5
+}
 
 send_prompt() {
   local prompt="${PROMPTS[$idx]}"
-  note "prompt $((idx + 1))/${#PROMPTS[@]}: $prompt"
   # Re-assert focus every prompt. Over a long unattended run a window manager
   # hint or a reconnecting VNC client can move it, and a prompt typed into the
   # void is indistinguishable from a hung server until much later.
-  xdotool windowactivate --sync "$WINDOW_ID" 2>/dev/null || true
+  focus_target || note "window '$WINDOW_NAME' not found — typing at whatever has focus"
+  if [ "$CLEAR_EVERY" -gt 0 ] && [ "$sent" -gt 0 ] && [ $(( sent % CLEAR_EVERY )) -eq 0 ]; then
+    clear_context
+  fi
+  note "prompt $((idx + 1))/${#PROMPTS[@]}: $prompt"
   jiggle_mouse
   type_text "$prompt"
   sleep 0.4
   press_enter
+  sent=$(( sent + 1 ))
+  awaiting=$SECONDS
+}
+
+# Move to the next prompt and type it. Returns 1 when the run is over, which is
+# the only way out of the read loop. Shared by the turn_end branch and the stall
+# watchdog so a recovered turn advances exactly like a real one.
+advance_and_send() {
+  idx=$(( idx + 1 ))
+  if [ "$idx" -ge "${#PROMPTS[@]}" ]; then
+    idx=0
+    if [ "$CYCLES" != "forever" ] && [ "$cycle" -ge "$CYCLES" ]; then
+      note "prompt list done — exiting"
+      return 1
+    fi
+    cycle=$(( cycle + 1 ))
+    note "cycle $cycle — pausing ${CYCLE_PAUSE}s"
+    sleep "$CYCLE_PAUSE"
+  else
+    scroll_mouse
+    sleep "$READ_SECS"
+  fi
+  send_prompt
 }
 
 # Attach to the stream *before* typing anything, so the subscription is live by
-# the time the first turn ends — opening the fifo is what lets curl connect.
-exec 3<"$EVENTS_FIFO"
+# the time the first turn ends.
+start_events
 
 # Kick off the first prompt; everything after it is event-driven.
 send_prompt
 
-while IFS= read -r line <&3; do
+while true; do
+  # A timed read, not a blocking one. Nothing else in this loop can notice that
+  # an event went missing, and every way that happens — a dropped stream, a
+  # server restart, a permission prompt that never got its Enter — otherwise
+  # ends as a driver sitting silently forever next to an idle CLI.
+  if IFS= read -t "$POLL_SECS" -r line <&3; then
+    :
+  elif kill -0 "$SSE_PID" 2>/dev/null; then
+    # Timed out with nothing to read. That is normal — the server only speaks at
+    # tool_use and turn_end, and pings in between — so only act on a silence
+    # long enough that no legitimate turn could still be running.
+    #
+    # The liveness check is how timeout is told apart from end-of-stream: bash
+    # 3.2 (still what macOS ships) returns 1 for both, so read's status can't
+    # distinguish them. A fifo with a live writer cannot be at EOF, so if the
+    # subshell is still there, this was a timeout.
+    if [ $(( SECONDS - awaiting )) -ge "$STALL_SECS" ]; then
+      note "no events for ${STALL_SECS}s — assuming the turn was missed, moving on"
+      advance_and_send || break
+    fi
+    continue
+  else
+    # EOF: the writer subshell died. It is built never to, so this is a kill
+    # from outside; rebuild it rather than letting the run end here.
+    note "events reader hit EOF — restarting the subscription"
+    stop_events
+    sleep 2
+    wait_for_health || true
+    start_events
+    awaiting=$SECONDS
+    continue
+  fi
+
   # Matched on the quoted event name alone, so JSON spacing can't break this.
   case "$line" in
     *'"ping"'*|*'"hello"'*)
+      # Deliberately does not reset the stall clock: a ping proves the stream is
+      # up, not that the turn is progressing.
       continue ;;
     *'"tool_use"'*)
       note "tool call — permission prompt incoming, Enter in ${CONFIRM_DELAY}s (x${CONFIRM_RETRIES})"
+      awaiting=$SECONDS
       sleep "$CONFIRM_DELAY"
       for (( i = 0; i < CONFIRM_RETRIES; i++ )); do
         press_enter
-        [ "$i" -lt "$(( CONFIRM_RETRIES - 1 ))" ] && sleep "$CONFIRM_RETRY_GAP"
+        # An `&&` here would leave the loop at status 1 on its last pass, which
+        # under set -e takes the whole script down with it.
+        if [ "$i" -lt "$(( CONFIRM_RETRIES - 1 ))" ]; then
+          sleep "$CONFIRM_RETRY_GAP"
+        fi
       done
       ;;
-    *'"turn_end"'*)
-      idx=$(( idx + 1 ))
-      if [ "$idx" -ge "${#PROMPTS[@]}" ]; then
-        idx=0
-        if [ "$CYCLES" != "forever" ] && [ "$cycle" -ge "$CYCLES" ]; then
-          note "prompt list done — exiting"
-          break
-        fi
-        cycle=$(( cycle + 1 ))
-        note "cycle $cycle — pausing ${CYCLE_PAUSE}s"
-        sleep "$CYCLE_PAUSE"
-      else
-        scroll_mouse
-        sleep "$READ_SECS"
-      fi
-      send_prompt
+    # turn_abort is the server saying a turn ended without finishing — the CLI
+    # hung up mid-stream, or the request was cancelled. Same handling: there is
+    # nothing more coming for this prompt, so move to the next one.
+    *'"turn_end"'*|*'"turn_abort"'*)
+      advance_and_send || break
       ;;
     '')
       continue ;;

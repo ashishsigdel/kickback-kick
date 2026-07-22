@@ -62,6 +62,13 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 @dataclass(frozen=True)
 class Config:
     host: str
@@ -72,6 +79,7 @@ class Config:
     think_min: float  # shortest "thinking" pause before a response
     think_max: float  # longest "thinking" pause before a response
     script_loop: bool  # restart a script from the top once it runs out
+    log_bodies: bool  # dump every request body to logs/ (off by default)
 
     @property
     def duration_label(self) -> str:
@@ -102,7 +110,8 @@ CONFIG = Config(
     turn_delay=env_int("TURN_DELAY_MS", 500) / 1000,
     think_min=_THINK_MIN,
     think_max=_THINK_MAX,
-    script_loop=os.getenv("SCRIPT_LOOP", "true").strip().lower() not in ("0", "false", "no", "off"),
+    script_loop=env_bool("SCRIPT_LOOP", True),
+    log_bodies=env_bool("FAKE_LOG_BODIES", False),
 )
 
 
@@ -113,6 +122,9 @@ CONFIG = Config(
 class Session:
     id: str
     started_at: float = field(default_factory=time.monotonic)
+    # Touched on every request the session is looked up for. A run that lasts
+    # days would otherwise accumulate a Session per hashed conversation forever.
+    last_seen: float = field(default_factory=time.monotonic)
     turns: int = 0
     # How far into each script this session has played, so a follow-up message
     # continues the transcript instead of restarting it.
@@ -180,12 +192,14 @@ def session_for(body: dict[str, Any]) -> Session:
             key = json.loads(key).get("session_id") or key
         except (json.JSONDecodeError, AttributeError):
             pass
-        return SESSIONS.setdefault(key, Session(id=str(key)[:12]))
-    if not key:
+        session = SESSIONS.setdefault(key, Session(id=str(key)[:12]))
+    else:
         messages = body.get("messages") or []
         seed = json.dumps(messages[0], sort_keys=True) if messages else "empty"
         key = hashlib.sha1(seed.encode()).hexdigest()[:12]
-    return SESSIONS.setdefault(key, Session(id=str(key)))
+        session = SESSIONS.setdefault(key, Session(id=str(key)))
+    session.last_seen = time.monotonic()
+    return session
 
 
 # --------------------------------------------------------------------------- rules
@@ -393,22 +407,45 @@ def last_user_text(body: dict[str, Any]) -> str:
     return ""
 
 
+# Prompts the CLI writes on the user's behalf. They are indistinguishable from a
+# real turn by shape — same tools, same session — so they have to be matched on
+# their text. Left unhandled, the recap below fires on its own after a few idle
+# minutes, eats a script segment and publishes a turn_end nobody asked for,
+# which makes the driver type over a response that is still streaming.
+#
+# One entry, because one is all that has actually been observed in logs/. Add to
+# it the same way: find a request whose last user message is neither an
+# @mention nor a tool_result, and match its opening words.
+CLI_PROBE_RE = re.compile(r"^\s*The user stepped away and is coming back", re.IGNORECASE)
+
+
 def is_agent_request(body: dict[str, Any]) -> bool:
     """True for the actual conversation turn, false for the CLI's side requests.
 
     Every prompt fires two calls: the real one, carrying the CLI's whole tool
     set, and a small tool-less one that asks for a conversation title. They are
     otherwise identical — same model, same session, same metadata — so `tools`
-    is the discriminator. Side requests must never consume a script segment or
-    publish an event: doing so eats the transcript a turn at a time and makes
-    the driver type over a response that is still streaming.
+    is the discriminator for that pair. It is not sufficient on its own: the
+    CLI also injects prompts of its own that *do* carry the tool set, so
+    CLI_PROBE_RE has to rule those out too.
+
+    Side requests must never consume a script segment or publish an event:
+    doing so eats the transcript a turn at a time and makes the driver type
+    over a response that is still streaming.
     """
-    return bool(body.get("tools"))
+    if not body.get("tools"):
+        return False
+    return not CLI_PROBE_RE.match(last_user_text(body))
 
 
 def side_request_reply(body: dict[str, Any]) -> str:
-    """A short, plausible answer for a tool-less side request (a title)."""
+    """A short, plausible answer for a side request (a title, or a CLI probe)."""
     text = MENTION_RE.sub("", last_user_text(body)).strip()
+    # A probe asks for prose about the conversation, not a title of it —
+    # echoing the first six words of the instruction back would be visible in
+    # the transcript as the CLI's own prompt leaking through.
+    if CLI_PROBE_RE.match(text):
+        return "Picking up where we left off — still working through the issue you raised."
     # The prompt wraps the message in <session>…</session> — keep the inside.
     match = re.search(r"<session>(.*?)</session>", text, re.DOTALL)
     if match:
@@ -436,10 +473,25 @@ def log(line: str) -> None:
 
 
 def dump_body(path: str, body: dict[str, Any]) -> None:
-    LOG_DIR.mkdir(exist_ok=True)
+    """Write one request body to logs/, if FAKE_LOG_BODIES asked for it.
+
+    Off by default, and deliberately so. The CLI resends the whole transcript
+    every turn, so bodies grow with the conversation — a few hundred KB early,
+    over a megabyte by the end of a long run — and there is one per request.
+    An unattended run left this on produced 140MB in six hours; on a host with
+    a small ephemeral disk that ends as a failed write mid-run, which the CLI
+    sees as a 500. Cost, not value: the one-line log above says what happened.
+    """
+    if not CONFIG.log_bodies:
+        return
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
     name = f"{stamp}_{path.strip('/').replace('/', '_') or 'root'}.json"
-    (LOG_DIR / name).write_text(json.dumps(body, indent=2, ensure_ascii=False))
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        (LOG_DIR / name).write_text(json.dumps(body, indent=2, ensure_ascii=False))
+    except OSError as exc:
+        # A full disk must stay a logging problem, not a failed API request.
+        log(f"could not write {name} ({exc}) — continuing")
 
 
 def log_request(request: Request, body: dict[str, Any], session: Session | None) -> None:
@@ -600,7 +652,7 @@ async def stream_messages(request: Request, body: dict[str, Any], session: Sessi
     # segment consumed, no events. See is_agent_request().
     if not is_agent_request(body):
         reply = side_request_reply(body)
-        log(f"session={session.id} side request (no tools) — replying {reply!r}")
+        log(f"session={session.id} side request — replying {reply!r}")
         yield frame("message_start", message_start(new_message_id(), model))
         yield frame(
             "content_block_start",
@@ -636,6 +688,12 @@ async def stream_messages(request: Request, body: dict[str, Any], session: Sessi
     session.turns += 1
     log(f"session={session.id} playing {playlist.label} from segment {session.cursor(playlist.key) + 1}")
 
+    # Every path out of the block below has to publish exactly one event. The
+    # driver is blocked on this stream: it presses Enter on tool_use and types
+    # the next prompt on turn_end, and does nothing at all otherwise. A turn
+    # that ends without saying so — the client hung up mid-stream, the task was
+    # cancelled — used to leave it waiting on an event that was never coming.
+    settled = False
     try:
         yield frame("message_start", message_start(message_id, model))
         index = 0
@@ -650,6 +708,7 @@ async def stream_messages(request: Request, body: dict[str, Any], session: Sessi
             async for out in stream_tool_use(tool, index):
                 yield out
             publish("tool_use", session=session.id, tool=str(tool.get("name", "fake_tool")))
+            settled = True
             stop_reason = "tool_use"
         else:
             turn = 0
@@ -683,6 +742,7 @@ async def stream_messages(request: Request, body: dict[str, Any], session: Sessi
                         yield out
                     playlist.park()
                     publish("tool_use", session=session.id, tool=segment.tool["name"])
+                    settled = True
                     stop_reason = "tool_use"
                     break
                 resuming = False
@@ -740,21 +800,35 @@ async def stream_messages(request: Request, body: dict[str, Any], session: Sessi
         log(f"session={session.id} turn={session.turns} finished stop_reason={stop_reason}")
         if stop_reason != "tool_use":
             publish("turn_end", session=session.id, turn=session.turns)
+            settled = True
     except asyncio.CancelledError:
         log(f"stream cancelled (session={session.id})")
         raise
+    finally:
+        if not settled:
+            log(f"session={session.id} turn={session.turns} ended without finishing — publishing turn_abort")
+            publish("turn_abort", session=session.id, turn=session.turns)
 
 
 # --------------------------------------------------------------------------- app
 
 
+# A session nobody has touched for this long is over: the CLI was restarted, or
+# the conversation was cleared. Keeping it costs memory in a process that is
+# meant to stay up for days.
+SESSION_TTL = 3600
+
+
 async def report_remaining() -> None:
     while True:
         await asyncio.sleep(15)
-        if CONFIG.duration is None:
-            continue
-        for session in list(SESSIONS.values()):
-            if not session.expired:
+        now = time.monotonic()
+        for key, session in list(SESSIONS.items()):
+            if now - session.last_seen > SESSION_TTL:
+                del SESSIONS[key]
+                log(f"session={session.id} idle for {SESSION_TTL}s — forgetting it")
+                continue
+            if CONFIG.duration is not None and not session.expired:
                 log(f"session={session.id} budget remaining={session.remaining_label}")
 
 
@@ -769,7 +843,7 @@ async def lifespan(_: FastAPI):
     log(f"  SCRIPT_LOOP    {'on' if CONFIG.script_loop else 'off'}")
     log(f"  scripts        {SCRIPTS_DIR} ({len(list(SCRIPTS_DIR.glob('*.md')))} found, @name to play)")
     log(f"  responses      {RESPONSES_PATH} (reloaded per request)")
-    log(f"  request logs   {LOG_DIR}")
+    log(f"  request logs   {LOG_DIR if CONFIG.log_bodies else 'off (FAKE_LOG_BODIES=1 to dump bodies)'}")
     task = asyncio.create_task(report_remaining())
     try:
         yield
@@ -840,7 +914,7 @@ async def messages(request: Request):
 
     if not is_agent_request(body):
         reply = side_request_reply(body)
-        log(f"session={session.id} side request (no tools) — replying {reply!r}")
+        log(f"session={session.id} side request — replying {reply!r}")
         return JSONResponse(
             {
                 "id": new_message_id(),

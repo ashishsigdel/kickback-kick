@@ -6,7 +6,7 @@
 # to the real Anthropic API.
 set -euo pipefail
 
-BASE_URL="${FAKE_CLAUDE_URL:-http://127.0.0.1:8787}"
+BASE_URL="${FAKE_CLAUDE_URL:-https://kickback-kick.onrender.com}"
 
 # Present as a real model so the CLI's header, status line and /model output
 # look exactly like a normal session. The mock server echoes back whatever
