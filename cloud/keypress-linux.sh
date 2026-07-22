@@ -119,8 +119,15 @@ fi
 
 # A sleeping free-tier host answers nothing for the first ~50s, so treat silence
 # as "not awake yet" before treating it as "not there".
+#
+# Pulled out into a function, not just inline at startup, because the events
+# reconnect loop below calls it too: a dropped stream and a Render free-tier
+# restart look the same from here, and blindly retrying curl every 2s against a
+# host that's still waking up just produces a wall of connection errors instead
+# of actually waiting the cold start out.
 WAKE_SECS="${FAKE_CLAUDE_WAKE_SECS:-90}"
-if ! curl -fsS --max-time 5 "$BASE_URL/health" >/dev/null 2>&1; then
+wait_for_health() {
+  curl -fsS --max-time 5 "$BASE_URL/health" >/dev/null 2>&1 && return 0
   printf 'keypress-linux.sh: waking %s (up to %ss)' "$BASE_URL" "$WAKE_SECS" >&2
   deadline=$(( SECONDS + WAKE_SECS ))
   until curl -fsS --max-time 10 "$BASE_URL/health" >/dev/null 2>&1; do
@@ -135,7 +142,9 @@ if ! curl -fsS --max-time 5 "$BASE_URL/health" >/dev/null 2>&1; then
     sleep 2
   done
   printf ' up\n' >&2
-fi
+}
+
+wait_for_health
 
 # /events is what drives this script. A server started before it existed answers
 # 404 — a restart is the fix, and it's worth saying so plainly.
@@ -248,10 +257,24 @@ mkfifo "$EVENTS_FIFO"
 # and a run that silently stops three hours in looks exactly like a run that
 # finished.
 #
+# wait_for_health runs before each reconnect attempt so a Render free-tier
+# restart turns into one visible wait instead of a curl failure every 2s.
+# stderr is dropped on the curl call itself — the printf below is the one
+# message this produces, instead of raw "curl: (56) Recv failure" noise. The
+# `|| true` matters under set -e: without it, curl's exit status on the very
+# first drop would kill this subshell for good instead of looping.
+#
 # The gap is not free: events emitted while disconnected are gone, and a missed
 # turn_end leaves the driver waiting for something that already happened. If a
 # run stalls with the CLI plainly idle, that's this — Ctrl-C and restart.
-( while true; do curl -fsS -N "$EVENTS_URL" || true; sleep 2; done ) > "$EVENTS_FIFO" &
+(
+  while true; do
+    curl -fsS -N "$EVENTS_URL" 2>/dev/null || true
+    printf '\n\033[2m--- keys: events stream dropped — reconnecting\033[0m\n' >&2
+    sleep 2
+    wait_for_health
+  done
+) > "$EVENTS_FIFO" &
 SSE_PID=$!
 trap 'pkill -P "$SSE_PID" 2>/dev/null || true; kill "$SSE_PID" 2>/dev/null || true; rm -f "$EVENTS_FIFO"' EXIT
 trap 'echo; note "interrupted — stopping"; exit 130' INT TERM
